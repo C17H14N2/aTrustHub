@@ -95,15 +95,9 @@ func TestEmptyView(t *testing.T) {
 			t.Errorf("view lacks %q; texts = %s", want, texts)
 		}
 	}
-	// 系统代理没开时统一入口整块隐藏：它不参与任何转发。
-	if strings.Contains(texts, "统一入口") {
-		t.Errorf("系统代理关闭时不该显示统一入口；texts = %s", texts)
-	}
-
-	a.sysProxyOn = true
-	on := strings.Join(ui.NewTester(a.view, 1120, 800).Texts(), "|")
-	if !strings.Contains(on, "统一入口") {
-		t.Errorf("系统代理开启后应当显示统一入口；texts = %s", on)
+	// 统一入口始终显示，系统代理关着也一样（手动配浏览器时要用地址）。
+	if !strings.Contains(texts, "统一入口") {
+		t.Errorf("统一入口应当始终显示；texts = %s", texts)
 	}
 }
 
@@ -607,5 +601,18 @@ func TestLogoutTextByMode(t *testing.T) {
 		if c.browser != (c.mode == model.AuthModeSSO) {
 			t.Errorf("%s: 期望值写错了", c.mode)
 		}
+	}
+}
+
+// 页头设置入口只有齿轮图标，没有文字。
+func TestSettingsIsIconOnly(t *testing.T) {
+	a := testApp(t)
+	tt := ui.NewTester(a.view, 1120, 800)
+	texts := strings.Join(tt.Texts(), "|")
+	if strings.Contains(texts, "设置") {
+		t.Errorf("页头不该有「设置」文字；texts = %s", texts)
+	}
+	if settingsIcon == nil {
+		t.Fatal("设置图标未定义")
 	}
 }
