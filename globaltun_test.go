@@ -1,10 +1,13 @@
 package main
 
 import (
+	"github.com/qy/easyconnect/internal/model"
 	"github.com/qy/easyconnect/internal/vpn"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // The helper must be found from a development build directory, which is where
@@ -157,5 +160,204 @@ func TestTeardownTUNOnExit(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(a.dir, name)); err == nil {
 			t.Errorf("退出后 %s 应当被删除", name)
 		}
+	}
+}
+
+// 接入点上配置的重定向规则必须一路带到 helper 的 tun-config：写 session 文件
+// 让它成为可用点，再断言 tunConfigFor 把 210.76.17.0:3306 映射带过去了。
+func TestTunConfigForCarriesMappings(t *testing.T) {
+	a := testApp(t)
+	a.openNewEditor()
+	a.editor.address = "https://vpn.example.edu.cn"
+	a.editor.username = "alice"
+	a.editor.cred = "pw-for-test"
+	a.editor.socksPort = "0"
+	a.saveEditor()
+	if a.editor.err != "" {
+		t.Fatalf("save: %s", a.editor.err)
+	}
+	id := a.store.Config().Points[0].ID
+	// 存下全局本地映射。
+	if _, err := a.store.Update(func(c *model.Config) error {
+		c.Settings.LocalMappings = map[string]string{"210.76.17.0:3306": "127.0.0.1:33060"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a.cfg = a.store.Config()
+
+	a.mgr.Connect(id)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if v, _ := a.mgr.View(id); v.State == vpn.StateOnline {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// tunConfigFor 要求 session 与资源文件存在。
+	atrustDir := filepath.Join(a.dir, "atrust")
+	if err := os.MkdirAll(atrustDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sess := `{"cookies":[{"Name":"sid","Value":"SIDSID"}],"device_id":"DEV1"}`
+	if err := os.WriteFile(filepath.Join(atrustDir, id+".json"), []byte(sess), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(atrustDir, id+".resource.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := a.tunConfigFor()
+	if err != nil {
+		t.Fatalf("tunConfigFor: %v", err)
+	}
+	if len(cfg.Points) != 1 {
+		t.Fatalf("points = %d, want 1", len(cfg.Points))
+	}
+	got, ok := cfg.Mappings["210.76.17.0:3306"]
+	if !ok || got != "127.0.0.1:33060" {
+		t.Fatalf("mapping not carried: %v", cfg.Mappings)
+	}
+}
+
+// 编辑器文本 <-> 重定向表 的解析与回写。
+func TestParseAndFormatRedirects(t *testing.T) {
+	m, err := parseRedirects("210.76.17.0:3306 -> 127.0.0.1:33060\n# 注释\n\n10.9.9.9=127.0.0.1:9000\n")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if m["210.76.17.0:3306"] != "127.0.0.1:33060" || m["10.9.9.9"] != "127.0.0.1:9000" {
+		t.Fatalf("parsed = %v", m)
+	}
+	text := formatRedirects(m)
+	if !strings.Contains(text, "210.76.17.0:3306 -> 127.0.0.1:33060") {
+		t.Fatalf("format = %q", text)
+	}
+	// 回写后再解析，等价。
+	back, err := parseRedirects(text)
+	if err != nil || len(back) != 2 || back["10.9.9.9"] != "127.0.0.1:9000" {
+		t.Fatalf("round-trip: %v %v", back, err)
+	}
+
+	// 空文本 -> nil，不报错。
+	if m, err := parseRedirects("  \n # x\n"); err != nil || m != nil {
+		t.Fatalf("empty: %v %v", m, err)
+	}
+
+	// 错误输入。
+	if _, err := parseRedirects("210.76.17.0:3306"); err == nil {
+		t.Error("缺箭头应当报错")
+	}
+	if _, err := parseRedirects("not-an-ip -> 127.0.0.1:1"); err == nil {
+		t.Error("目标不是 IP 应当报错")
+	}
+	if _, err := parseRedirects("210.76.17.0:3306 -> 127.0.0.1"); err == nil {
+		t.Error("本地缺端口应当报错")
+	}
+}
+
+// 端口映射弹窗：四输入框保存成映射表，落盘再读回，非法行被拒。
+func TestSaveMapSettingsRows(t *testing.T) {
+	a := testApp(t)
+	a.openMapSettings()
+	a.mapSettings.rows = []mapRow{
+		{TargetIP: "210.76.17.0", TargetPort: "3306", LocalIP: "127.0.0.1", LocalPort: "33060"},
+	}
+	a.saveMapSettings()
+	if a.mapSettings.err != "" {
+		t.Fatalf("save: %s", a.mapSettings.err)
+	}
+	if got := a.store.Config().Settings.LocalMappings["210.76.17.0:3306"]; got != "127.0.0.1:33060" {
+		t.Fatalf("mappings = %v", a.store.Config().Settings.LocalMappings)
+	}
+	// 重新打开应回显成一条四输入框的行。
+	a.openMapSettings()
+	if len(a.mapSettings.rows) != 1 ||
+		a.mapSettings.rows[0].TargetIP != "210.76.17.0" ||
+		a.mapSettings.rows[0].TargetPort != "3306" ||
+		a.mapSettings.rows[0].LocalIP != "127.0.0.1" ||
+		a.mapSettings.rows[0].LocalPort != "33060" {
+		t.Fatalf("rows = %+v", a.mapSettings.rows)
+	}
+
+	// 只填了部分字段应报错，不静默丢弃。
+	a.openMapSettings()
+	a.mapSettings.rows = []mapRow{{TargetIP: "10.0.0.1"}}
+	a.saveMapSettings()
+	if a.mapSettings.err == "" {
+		t.Fatal("部分填写的行应当报错")
+	}
+
+	// 全空的行跳过，不产生映射。
+	a.openMapSettings()
+	a.mapSettings.rows = []mapRow{{}, {}}
+	a.saveMapSettings()
+	if a.mapSettings.err != "" {
+		t.Fatalf("全空行应被跳过: %s", a.mapSettings.err)
+	}
+	if len(a.store.Config().Settings.LocalMappings) != 0 {
+		t.Fatalf("不该有映射: %v", a.store.Config().Settings.LocalMappings)
+	}
+}
+
+// 没有在线接入点、但配了端口映射时，tunConfigFor 不应报错，且带上映射。
+func TestTunConfigForMappingOnlyNoPoints(t *testing.T) {
+	a := testApp(t)
+	// 没有任何接入点，只设一条全局映射。
+	if _, err := a.store.Update(func(c *model.Config) error {
+		c.Settings.LocalMappings = map[string]string{"127.0.0.1:8080": "127.0.0.1:8080"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a.cfg = a.store.Config()
+	if !a.hasMappings() {
+		t.Fatal("hasMappings 应为 true")
+	}
+	cfg, err := a.tunConfigFor()
+	if err != nil {
+		t.Fatalf("有映射且无接入点时应允许：%v", err)
+	}
+	if len(cfg.Points) != 0 {
+		t.Fatalf("不该有接入点，got %d", len(cfg.Points))
+	}
+	if cfg.Mappings["127.0.0.1:8080"] != "127.0.0.1:8080" {
+		t.Fatalf("映射未带上：%v", cfg.Mappings)
+	}
+
+	// 既无接入点又无映射：仍应报错。
+	a2 := testApp(t)
+	if _, err := a2.tunConfigFor(); err == nil {
+		t.Fatal("无接入点无映射应报错")
+	}
+}
+
+// TUN 映射的连接要出现在访问日志里，并标注映射到本机哪个地址。
+func TestPublishAccessShowsMapping(t *testing.T) {
+	a := testApp(t)
+	a.publishAccess(accessRecord{
+		Time: time.Now().Unix(), Point: "本地映射",
+		Target: "210.76.17.0", Port: 3306, OK: true,
+		Via: "127.0.0.1:33060",
+	})
+	found := false
+	for _, e := range a.bus.Tail(50) {
+		if e.Source != vpn.AccessOK {
+			continue
+		}
+		if strings.Contains(e.Line, "210.76.17.0:3306") &&
+			strings.Contains(e.Line, "127.0.0.1:33060") &&
+			strings.Contains(e.Line, "本地映射") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		var lines []string
+		for _, e := range a.bus.Tail(50) {
+			lines = append(lines, e.Line)
+		}
+		t.Fatalf("访问日志缺少映射记录；现有 = %v", lines)
 	}
 }

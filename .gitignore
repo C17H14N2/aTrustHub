@@ -11,3 +11,11 @@ build/
 # TUN 辅助程序（由 third_party/zju-connect 编译产出，见 make helpers）
 resources/*/zju-connect-multitun
 resources/*/zju-connect-multitun.exe
+
+# 本地构建缓存（自定义 GOCACHE/GOMODCACHE）
+.gocache/
+.gomodcache/
+.gotmp/
+
+# 本地截图/临时产物
+.shots/

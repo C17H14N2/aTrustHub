@@ -80,6 +80,8 @@ type tunPointConfig struct {
 type tunConfigFile struct {
 	Points  []tunPointConfig `json:"points"`
 	DNSBind string           `json:"dnsBind"`
+	// Mappings is the global local-redirect table, independent of any point.
+	Mappings map[string]string `json:"mappings,omitempty"`
 }
 
 // savedClient is what the GUI saved at login and the helper resumes from.
@@ -162,9 +164,23 @@ func (a *app) tunConfigFor() (tunConfigFile, error) {
 		})
 	}
 	if len(cfg.Points) == 0 {
-		return cfg, fmt.Errorf("没有可用的登录会话，请重新登录一次")
+		// With local port mappings configured, TUN can run in "mapping only"
+		// mode even with no logged-in access point.
+		if len(a.cfg.Settings.LocalMappings) == 0 {
+			return cfg, fmt.Errorf("没有可用的登录会话，请重新登录一次")
+		}
+	}
+	// The global local mappings are not tied to a point: they ride along with
+	// the helper config and are applied to whichever stack runs.
+	if m := a.cfg.Settings.LocalMappings; len(m) > 0 {
+		cfg.Mappings = m
 	}
 	return cfg, nil
+}
+
+// hasMappings reports whether any local port mapping is configured.
+func (a *app) hasMappings() bool {
+	return len(a.cfg.Settings.LocalMappings) > 0
 }
 
 func (a *app) startGlobalTUN(id string) {
@@ -180,9 +196,12 @@ func (a *app) startGlobalTUN(id string) {
 		}
 	}()
 	if online, _, _ := a.mgr.Counts(); online == 0 {
-		a.toast = "没有在线接入点，先登录再开 TUN"
-		a.tunLogf("startGlobalTUN: 无在线接入点")
-		return
+		if !a.hasMappings() {
+			a.toast = "没有在线接入点，先登录再开 TUN（或先在端口映射里配一条映射）"
+			a.tunLogf("startGlobalTUN: 无在线接入点且无映射")
+			return
+		}
+		a.tunLogf("startGlobalTUN: 无在线接入点，仅按端口映射运行")
 	}
 	helper, tried := multitunPath()
 	if _, err := os.Stat(helper); err != nil {
@@ -202,7 +221,7 @@ func (a *app) startGlobalTUN(id string) {
 		a.tunLogf("startGlobalTUN: %v", err)
 		return
 	}
-	if len(cfg.Points) == 0 {
+	if len(cfg.Points) == 0 && len(cfg.Mappings) == 0 {
 		a.toast = "没有可用的登录会话，请重新登录一次"
 		a.tunLogf("startGlobalTUN: 无可恢复会话")
 		return

@@ -15,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -36,6 +37,7 @@ import (
 	"github.com/mythologyli/zju-connect/stack/gvisor"
 	"github.com/mythologyli/zju-connect/stack/tun"
 	"github.com/mythologyli/zju-connect/underlay"
+	"inet.af/netaddr"
 )
 
 type pointConfig struct {
@@ -55,6 +57,11 @@ type pointConfig struct {
 type tunConfig struct {
 	Points  []pointConfig `json:"points"`
 	DNSBind string        `json:"dnsBind"`
+	// Mappings is the global local-redirect table ("ip"/"ip:port" ->
+	// "host:port"), applied once to the first running stack. It lets traffic
+	// the VPN does not carry reach a local listener over the plain network
+	// (e.g. a RustDesk port mapping).
+	Mappings map[string]string `json:"mappings,omitempty"`
 }
 
 // hub owns the running stacks, so a new access point can join while the
@@ -65,6 +72,10 @@ type hub struct {
 	dns       *multiDNS
 	accessLog string
 	nextIndex int
+	// mappings is the global redirect table, applied once to the first stack
+	// that starts (and retried on later points if the first had none).
+	mappings    map[string]string
+	mappingsOK  bool
 }
 
 // addDomains records the internal domains a point can resolve, so public
@@ -98,6 +109,13 @@ func (h *hub) add(pc pointConfig) error {
 		}
 	}
 	log.Printf("point %s ready (fake range %s)", pc.Name, pc.FakeCIDR)
+	// Global local mappings: install once, on the first stack that comes up.
+	// One stack owning the /32 routes is enough; duplicating them across
+	// stacks would race on the same route.
+	if !h.mappingsOK && len(h.mappings) > 0 {
+		applyMappings(p.stack, h.mappings)
+		h.mappingsOK = true
+	}
 	return nil
 }
 
@@ -208,7 +226,7 @@ func main() {
 
 	// Points are added to the hub one by one: a point logged in later joins
 	// without disturbing the tunnels that already work.
-	hub := &hub{points: map[string]*point{}, dns: &multiDNS{}, accessLog: *accessLog}
+	hub := &hub{points: map[string]*point{}, dns: &multiDNS{}, accessLog: *accessLog, mappings: cfg.Mappings}
 	dnsReady := true
 	if err := startDNS(cfg.DNSBind, hub.dns); err != nil {
 		dnsReady = false
@@ -219,14 +237,35 @@ func main() {
 			log.Printf("point %s: %v", pc.Name, err)
 		}
 	}
+	mappingOnly := false
 	if hub.count() == 0 {
-		// Nothing runs, so leave the machine as we found it.
-		restoreSystemDNS()
-		fatal("no access point could start")
+		// No access point to carry, but if the user configured local port
+		// mappings we still bring up a minimal stack that only serves them.
+		if len(cfg.Mappings) > 0 {
+			if err := startMappingOnlyStack(hub, cfg.Mappings); err != nil {
+				log.Printf("mapping-only stack: %v", err)
+				restoreSystemDNS()
+				fatal("no access point and the mapping-only stack failed")
+			}
+			mappingOnly = true
+			log.Printf("纯端口映射模式：%d 条规则，无接入点", len(cfg.Mappings))
+		} else {
+			// Nothing runs, so leave the machine as we found it.
+			restoreSystemDNS()
+			fatal("no access point could start")
+		}
 	}
 	// A point's stack may take the system DNS over while starting, so claim it
 	// again once every point is up — but only if our resolver really listens.
-	if dnsReady {
+	// A mapping-only helper carries no tunnel, so it must not touch the
+	// machine's DNS at all: that is what left users offline before.
+	if mappingOnly {
+		restoreSystemDNS()
+	} else if dnsReady {
+		// Whatever happens from here on, put the machine's DNS back if this
+		// process unwinds (panic/return): leaving it pointed at 127.0.0.1
+		// with nobody listening means "connected but nothing resolves".
+		defer restoreSystemDNS()
 		setSystemDNS("127.0.0.1")
 	} else {
 		restoreSystemDNS()
@@ -259,7 +298,7 @@ func main() {
 	// can move the service DNS back to the tunnel's own server, which cannot
 	// answer internal names for the rest of the system.
 	stopGuard := make(chan struct{})
-	if dnsReady {
+	if dnsReady && !mappingOnly {
 		go guardDNS(stopGuard, "127.0.0.1")
 	}
 
@@ -408,6 +447,98 @@ func startPoint(pc pointConfig, accessLog string, index int) (*point, error) {
 	return &point{cfg: pc, client: cli, stack: st, dns: local}, nil
 }
 
+// applyMappings installs the global redirect table on one stack and adds a
+// /32 route per source IP so its packets reach the harness instead of the
+// default route. A bare "ip" key covers every port on that address.
+func applyMappings(st *tun.Stack, table map[string]string) {
+	if st == nil || len(table) == 0 {
+		return
+	}
+	st.SetupRedirects(table)
+	added := map[string]bool{}
+	for from := range table {
+		host := from
+		if h, _, err := net.SplitHostPort(from); err == nil {
+			host = h
+		}
+		if net.ParseIP(host) == nil || added[host] {
+			if net.ParseIP(host) == nil {
+				log.Printf("mapping: 跳过无效目标 %q", from)
+			}
+			continue
+		}
+		added[host] = true
+		if err := st.AddRoute(host + "/32"); err != nil {
+			log.Printf("mapping: route %s/32: %v", host, err)
+		}
+	}
+	log.Printf("本地映射：已安装 %d 条规则", len(table))
+}
+
+// mappingOnlyClient is a do-nothing client for a stack that carries no aTrust
+// tunnel, only local port mappings. The redirect path dials the target over
+// the plain network, never through this client, so everything here is inert.
+type mappingOnlyClient struct{ ip net.IP }
+
+func (c mappingOnlyClient) IP() (net.IP, error) { return c.ip, nil }
+func (c mappingOnlyClient) IPSet() (*netaddr.IPSet, error) {
+	return new(netaddr.IPSet), nil
+}
+func (c mappingOnlyClient) IPResources() ([]client.IPResource, error) { return nil, nil }
+func (c mappingOnlyClient) DomainResources() (client.DomainResources, error) {
+	return client.DomainResources{}, nil
+}
+func (c mappingOnlyClient) DNSResource() (map[string][]net.IP, error) { return nil, nil }
+func (c mappingOnlyClient) DNSServer() (string, error)                 { return "", nil }
+func (c mappingOnlyClient) DNSServers() ([]string, error)              { return nil, nil }
+func (c mappingOnlyClient) CanUseTCPTunnel() bool                      { return true }
+func (c mappingOnlyClient) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, error) {
+	return net.DialTCP("tcp", nil, addr)
+}
+func (c mappingOnlyClient) NewL3Conn() (io.ReadWriteCloser, error) { return discardReadWriteCloser{}, nil }
+
+// discardReadWriteCloser blocks forever on Read (nothing arrives on an L3
+// tunnel that does not exist) and drops writes.
+type discardReadWriteCloser struct{}
+
+func (discardReadWriteCloser) Read(p []byte) (int, error) {
+	select {} // block: the read loop must not spin
+}
+func (discardReadWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (discardReadWriteCloser) Close() error                { return nil }
+
+// startMappingOnlyStack brings up one stack whose only job is to carry the
+// configured local port mappings, without any aTrust session.
+func startMappingOnlyStack(h *hub, table map[string]string) error {
+	// A private, otherwise-unused address for the utun. It does not reach any
+	// server; it only gives the interface an address to route /32s to.
+	local := net.IP{198, 18, 250, 1}
+	cli := mappingOnlyClient{ip: local}
+	// dnsHijack must stay false: there is no tunnel to resolve through, and
+	// taking the system DNS over in this mode would leave the machine offline
+	// if this helper ever exits. fakeIP is off for the same reason.
+	st, err := tun.NewStack(cli, false, false, nil)
+	if err != nil {
+		return err
+	}
+	applyMappings(st, table)
+	// Redirected connections must show up in the access log too, exactly like
+	// a point's traffic.
+	if h.accessLog != "" {
+		logger := &accessLogger{path: h.accessLog, point: "本地映射"}
+		st.AccessLog = logger.log
+		st.AccessLogVia = logger.logVia
+	}
+	go st.Run()
+	// Register as a pseudo point so probes/status have something, and so the
+	// process counts as "running".
+	h.mu.Lock()
+	h.points["（本地端口映射）"] = &point{cfg: pointConfig{Name: "（本地端口映射）"}, stack: st}
+	h.mappingsOK = true
+	h.mu.Unlock()
+	return nil
+}
+
 // accessLogger appends one JSON line per carried connection.
 type accessLogger struct {
 	path  string
@@ -416,8 +547,22 @@ type accessLogger struct {
 }
 
 func (l *accessLogger) log(target string, port int, ok bool) {
-	rec := fmt.Sprintf(`{"t":%d,"point":%q,"target":%q,"port":%d,"ok":%t}`,
-		time.Now().Unix(), l.point, target, port, ok)
+	l.write(target, port, ok, "")
+}
+
+// logVia records a locally redirected connection together with the local
+// destination it was mapped to.
+func (l *accessLogger) logVia(target string, port int, ok bool, via string) {
+	l.write(target, port, ok, via)
+}
+
+func (l *accessLogger) write(target string, port int, ok bool, via string) {
+	viaField := ""
+	if via != "" {
+		viaField = fmt.Sprintf(`,"via":%q`, via)
+	}
+	rec := fmt.Sprintf(`{"t":%d,"point":%q,"target":%q,"port":%d,"ok":%t%s}`,
+		time.Now().Unix(), l.point, target, port, ok, viaField)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)

@@ -229,6 +229,13 @@ type Settings struct {
 	// HideDock keeps the app out of the Dock (macOS), with a menu bar icon
 	// instead, so closing the window leaves it running.
 	HideDock bool `json:"hideDock"`
+	// LocalMappings is a global redirect table, independent of any access
+	// point: when a connection targets a key ("ip" for any port, or "ip:port")
+	// it is carried to the value's local "host:port" over the plain network
+	// instead of the tunnel. It is only applied while global TUN is on. Useful
+	// when a remote host must go through a local TCP tunnel (e.g. RustDesk
+	// maps 210.76.17.0:3306 to 127.0.0.1:33060 locally).
+	LocalMappings map[string]string `json:"localMappings,omitempty"`
 	// AutoLoginOptIn records that the user has been offered the auto-login
 	// default. Access points do not log in at startup unless they ask for it.
 	AutoLoginOptIn bool `json:"autoLoginOptIn"`

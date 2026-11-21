@@ -19,6 +19,9 @@ type accessRecord struct {
 	Target string `json:"target"`
 	Port   int    `json:"port"`
 	OK     bool   `json:"ok"`
+	// Via is the local destination a redirected (mapped) connection was sent
+	// to, e.g. "127.0.0.1:33060".
+	Via string `json:"via,omitempty"`
 }
 
 // accessLogPath is where the TUN helper appends its access records.
@@ -80,6 +83,10 @@ func (a *app) publishAccess(rec accessRecord) {
 		target = fmt.Sprintf("%s:%d", rec.Target, rec.Port)
 	}
 	appName := a.appNameForHost(rec.Target)
+	if rec.Via != "" {
+		// A mapped connection: show where it actually went.
+		target = fmt.Sprintf("%s ⇢ %s", target, rec.Via)
+	}
 	plain := fmt.Sprintf("%s → %s", target, rec.Point)
 	plainFail := fmt.Sprintf("%s ｜ %s", target, rec.Point)
 	if appName != "" {

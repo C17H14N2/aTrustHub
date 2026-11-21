@@ -114,6 +114,8 @@ type app struct {
 	editor editorDraft
 	// settings is the settings dialog.
 	settings settingsDraft
+	// mapSettings is the port-mapping dialog (with the TUN log entry).
+	mapSettings mapSettingsDraft
 	// deleting is the ID whose deletion the app asks about.
 	deleting string
 
@@ -192,6 +194,22 @@ type settingsDraft struct {
 	// hideDock hides the macOS Dock icon; the menu bar icon takes over.
 	hideDock bool
 	err      string
+}
+
+// mapRow is one port-mapping row in the mapping dialog: four inputs, so the
+// user never types the "目标 -> 本地" syntax by hand.
+type mapRow struct {
+	TargetIP   string
+	TargetPort string
+	LocalIP    string
+	LocalPort  string
+}
+
+// mapSettingsDraft is the port-mapping dialog state, with the TUN log entry.
+type mapSettingsDraft struct {
+	open bool
+	rows []mapRow
+	err  string
 }
 
 func main() {

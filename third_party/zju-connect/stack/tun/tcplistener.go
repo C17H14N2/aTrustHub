@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"github.com/mythologyli/zju-connect/client"
 	"github.com/mythologyli/zju-connect/internal/hook_func"
@@ -147,6 +148,30 @@ func (s *Stack) handleInboundConn(lConn net.Conn, targetIP string, targetPort ui
 	defer func(lConn net.Conn) {
 		_ = lConn.Close()
 	}(lConn)
+
+	// A redirect rule sends this connection to a local listener over the plain
+	// network, bypassing the tunnel entirely. This is the path a target the VPN
+	// would not carry (or that the user mapped on purpose) takes.
+	if local, ok := s.redirectTarget(net.ParseIP(targetIP), int(targetPort)); ok {
+		log.Printf("redirect %s:%d -> %s (local)", targetIP, targetPort, local)
+		remoteConn, err := net.DialTimeout("tcp", local, 10*time.Second)
+		if err != nil {
+			// Report the failure against the original target, so the access
+			// log says which mapping is broken.
+			log.Printf("Error dialing redirect target %s: %v", local, err)
+			s.logAccessVia(targetIP, int(targetPort), err, local)
+			return
+		}
+		s.logAccessVia(targetIP, int(targetPort), nil, local)
+		defer func(remoteConn net.Conn) {
+			_ = remoteConn.Close()
+		}(remoteConn)
+		errCh := make(chan error, 2)
+		go func() { _, err := io.Copy(remoteConn, lConn); errCh <- err }()
+		go func() { _, err := io.Copy(lConn, remoteConn); errCh <- err }()
+		<-errCh
+		return
+	}
 
 	domain, resources, ok := s.ipPool.GetDomain(net.ParseIP(targetIP))
 	ctx := context.Background()

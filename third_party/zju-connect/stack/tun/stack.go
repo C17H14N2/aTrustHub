@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 
 	"github.com/miekg/dns"
@@ -40,10 +41,57 @@ type Stack struct {
 	resourceCache       *resourceDecisionCache
 	ipPool              *ippool.IPPool[[]client.DomainResource]
 	fakeIP              bool
+	// redirects maps an "ip:port" (or plain "ip", any port) the local machine
+	// tries to reach to a local "host:port" that should actually receive the
+	// connection. It is checked before the VPN resource tables, so a target
+	// that the VPN would otherwise drop can be carried too. Each matched
+	// connection is dialed over the plain local network, never the tunnel.
+	redirects map[string]string
 	// AccessLog, when set, hears each TCP connection the stack carries:
 	// the target it resolved (a domain when fake IP is in use), the port and
 	// whether it was accepted.
 	AccessLog func(target string, port int, ok bool)
+	// AccessLogVia, when set, is used for locally redirected connections so
+	// the log can show where the mapping actually sent them.
+	AccessLogVia func(target string, port int, ok bool, via string)
+}
+
+// SetupRedirects installs the local redirect table. Keys are "ip:port", or
+// "ip" to redirect every port on that address; values are local "host:port"
+// destinations (resolved on the machine, not over the tunnel).
+func (s *Stack) SetupRedirects(table map[string]string) {
+	if len(table) == 0 {
+		s.redirects = nil
+		return
+	}
+	clean := make(map[string]string, len(table))
+	for k, v := range table {
+		if k = strings.TrimSpace(k); k == "" {
+			continue
+		}
+		if v = strings.TrimSpace(v); v == "" {
+			continue
+		}
+		clean[k] = v
+	}
+	s.redirects = clean
+}
+
+// redirectTarget returns the local destination a packet should be sent to
+// instead of its original target, when a redirect rule matches. It accepts
+// "ip:port" keys first, then a bare "ip" key that covers every port.
+func (s *Stack) redirectTarget(destIP net.IP, port int) (string, bool) {
+	if len(s.redirects) == 0 {
+		return "", false
+	}
+	ip := destIP.String()
+	if v, ok := s.redirects[fmt.Sprintf("%s:%d", ip, port)]; ok {
+		return v, true
+	}
+	if v, ok := s.redirects[ip]; ok {
+		return v, true
+	}
+	return "", false
 }
 
 // ifaceName, when set, names the Windows adapter, so several stacks can run
@@ -62,6 +110,14 @@ func (s *Stack) SetupIPPool(ipPool *ippool.IPPool[[]client.DomainResource]) {
 }
 
 func (s *Stack) Run() {
+	// A panic here used to kill the helper while the system was already
+	// pointed at its DNS and routes, which left the machine offline. Report
+	// and unwind instead: the helper's shutdown path then restores DNS.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("TUN: stack panicked, stopping this access point: %v", r)
+		}
+	}()
 	if s.endpoint.client.CanUseTCPTunnel() {
 		err := s.CreateTCPListener()
 		if err != nil {
@@ -165,7 +221,26 @@ func (s *Stack) processIPV4(packet zctcpip.IPv4Packet) error {
 		return fmt.Errorf("protocol %d not supported, skip", packet.Protocol())
 	}
 
-	domain, resources, ok := s.ipPool.GetDomain(packet.DestinationIP())
+	// A configured redirect wins over the VPN tables: the user asked this
+	// target to be carried by a local listener instead of the access point.
+	// Only TCP is redirected; other protocols fall through to the normal path.
+	if protocol == "tcp" {
+		if local, ok := s.redirectTarget(packet.DestinationIP(), port); ok {
+			log.DebugPrintf("redirect %s:%d -> %s (local)", packet.DestinationIP(), port, local)
+			// The real outcome is logged by handleInboundConn once the local
+			// dial finishes, so a failed mapping is not reported as accepted.
+			return s.processRedirectTCP(packet, packet.Payload(), local)
+		}
+	}
+
+	var domain string
+	var resources []client.DomainResource
+	ok := false
+	// A mapping-only stack has no fake-IP pool; skip the domain lookup there
+	// instead of dereferencing a nil pool.
+	if s.ipPool != nil {
+		domain, resources, ok = s.ipPool.GetDomain(packet.DestinationIP())
+	}
 	if ok {
 		log.DebugPrintf("IP to domain %s", domain)
 
@@ -216,6 +291,19 @@ func (s *Stack) logAccess(target string, port int, err error) {
 	s.AccessLog(target, port, err == nil)
 }
 
+// logAccessVia reports one locally redirected connection, including the local
+// destination it was mapped to.
+func (s *Stack) logAccessVia(target string, port int, err error, via string) {
+	if target == "" {
+		return
+	}
+	if s.AccessLogVia != nil {
+		s.AccessLogVia(target, port, err == nil, via)
+		return
+	}
+	s.logAccess(target, port, err)
+}
+
 func (s *Stack) matchesStaticResource(destination net.IP, protocol string, port int) bool {
 	ip, ok := ipresource.IPv4Uint32(destination)
 	if !ok {
@@ -240,6 +328,24 @@ func (s *Stack) matchStaticResource(destination net.IP, protocol string, port in
 		s.resourceCache = newResourceDecisionCache()
 	})
 	return s.resourceIndex.Match(destination, protocol, port)
+}
+
+// processRedirectTCP feeds a redirected TCP packet into the same gvisor
+// forwarder the tunnel uses, but marks the target so handleInboundConn dials
+// its local destination instead of the VPN. It needs the TCP listener stack,
+// which only exists when the client can use a TCP tunnel; if it does not, the
+// redirect cannot be carried and the packet is dropped with a clear log.
+func (s *Stack) processRedirectTCP(packet zctcpip.IPv4Packet, tcpPacket zctcpip.TCPPacket, local string) error {
+	if s.tcpListenerEndpoint == nil || s.tcpListenerStack == nil {
+		return fmt.Errorf("redirect %s:%d -> %s: TCP 隧道未就绪，无法本地转发",
+			packet.DestinationIP(), tcpPacket.DestinationPort(), local)
+	}
+	pkt := gvisorstack.NewPacketBuffer(gvisorstack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(packet),
+	})
+	defer pkt.DecRef()
+	s.tcpListenerEndpoint.dispatcher.DeliverNetworkPacket(ipv4.ProtocolNumber, pkt)
+	return nil
 }
 
 func (s *Stack) processIPV4TCP(packet zctcpip.IPv4Packet, tcpPacket zctcpip.TCPPacket, useTCPTunnel bool) error {
@@ -313,6 +419,12 @@ func (s *Stack) processIPV4ICMP(packet zctcpip.IPv4Packet, icmpHeader zctcpip.IC
 // only can handle udp dns query!
 func (s *Stack) shouldHijackUDPDns(ipHeader zctcpip.IPv4Packet, udpHeader zctcpip.UDPPacket) bool {
 	if udpHeader.DestinationPort() != 53 {
+		return false
+	}
+	// A stack without a resolver (mapping-only mode) must not hijack DNS:
+	// dereferencing a nil resolver here used to crash the helper and leave
+	// the machine pointed at a dead DNS server.
+	if s.resolve == nil {
 		return false
 	}
 	return s.resolve.CheckDnsHijack(ipHeader.DestinationIP())

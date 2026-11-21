@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,7 +21,6 @@ import (
 	"github.com/qy/easyconnect/internal/vpn"
 )
 
-// logIcon is a small document-with-lines glyph for the TUN log button.
 // githubIcon is the repository mark shown in the footer.
 var githubIcon = ui.MustParseSVG([]byte(`<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.3-1.7-1.3-1.7-1.1.7 0 0 0 0 1.2-.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3"/></svg>`))
 
@@ -48,10 +48,13 @@ func iconButton(c *ui.Context, icon *ui.SVG, tooltip string, onClick func()) {
 	})
 }
 
-// settingsIcon is a gear, used in the header button.
 var settingsIcon = ui.MustParseSVG([]byte(`<svg viewBox="0 0 1024 1024" fill="currentColor"><path d="M439.816 101.851c-8.631-16.952-28.007-25.48-46.337-20.396-70.066 19.435-133.165 55.501-184.82 103.628-12.909 12.028-16.413 31.094-8.623 46.926 5.374 10.92 8.414 23.234 8.414 36.376 0 45.555-36.833 82.347-82.1 82.347-0.381 0-0.762-0.003-1.142-0.008-17.691-0.253-33.448 11.147-38.74 28.031C73.159 421.209 66 466.344 66 513.078c0 30.844 3.118 61.001 9.07 90.156 4.1 20.082 22.714 33.816 43.111 31.808a83.069 83.069 0 0 1 8.169-0.399c45.267 0 82.1 36.791 82.1 82.346 0 20.276-7.254 38.74-19.334 53.086-13.177 15.649-12.423 38.718 1.748 53.472 52.742 54.916 119.403 96.417 194.376 118.784 20.888 6.231 42.918-5.408 49.543-26.174 10.616-33.275 41.714-57.212 78.217-57.212s67.601 23.937 78.217 57.212c6.625 20.766 28.655 32.405 49.543 26.174 74.973-22.367 141.634-63.868 194.376-118.784 14.17-14.755 14.924-37.823 1.748-53.471-12.08-14.346-19.334-32.811-19.334-53.087 0-45.554 36.834-82.346 82.1-82.346 2.773 0 5.496 0.135 8.169 0.399 20.397 2.008 39.011-11.726 43.111-31.808 5.951-29.155 9.07-59.312 9.07-90.156 0-46.734-7.16-91.869-20.468-134.323-5.292-16.884-21.049-28.285-38.741-28.031-0.379 0.005-0.76 0.008-1.141 0.008-45.266 0-82.1-36.792-82.1-82.347 0-13.142 3.04-25.456 8.414-36.376 7.79-15.832 4.286-34.898-8.623-46.926-51.655-48.127-114.754-84.193-184.82-103.628-18.33-5.084-37.706 3.444-46.337 20.396-13.648 26.806-41.357 44.97-73.184 44.97-31.827 0-59.536-18.164-73.184-44.97zM288.45 268.385c0-14.471-1.9-28.535-5.47-41.936 31.114-25.118 66.377-45.232 104.576-59.156 29.686 36.285 74.82 59.528 125.444 59.528 50.624 0 95.758-23.243 125.444-59.528 38.199 13.924 73.462 34.038 104.576 59.156a162.748 162.748 0 0 0-5.47 41.936c0 79.513 57.113 145.772 132.604 159.667 6.434 27.261 9.846 55.723 9.846 85.026 0 14.581-0.845 28.951-2.485 43.065-79.109 10.814-139.965 78.769-139.965 160.846 0 26.162 6.201 50.922 17.202 72.84-30.829 27.076-66.197 49.043-104.786 64.612-28.717-45.337-79.271-75.496-136.966-75.496-57.695 0-108.249 30.159-136.966 75.496-38.589-15.569-73.957-37.536-104.787-64.612 11.002-21.918 17.203-46.678 17.203-72.84 0-82.077-60.856-150.032-139.965-160.846A373.007 373.007 0 0 1 146 513.078c0-29.304 3.411-57.765 9.845-85.026 75.492-13.894 132.605-80.154 132.605-159.667zM513 336c-97.202 0-176 78.798-176 176s78.798 176 176 176 176-78.798 176-176-78.798-176-176-176zM409 512c0-57.438 46.562-104 104-104s104 46.562 104 104-46.562 104-104 104-104-46.562-104-104z"/></svg>`))
 
+// logIcon is the document-with-lines glyph for the TUN log button.
 var logIcon = ui.MustParseSVG([]byte(`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M8 13h8"/><path d="M8 17h8"/></svg>`))
+
+// accessIcon is a list glyph for the access-log button.
+var accessIcon = ui.MustParseSVG([]byte(`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg>`))
 
 // view builds one frame of the window: the header, the aggregate proxy,
 // the access points and their log.
@@ -87,6 +90,7 @@ func (a *app) view(c *ui.Context) {
 	})
 	a.editorView(c)
 	a.settingsView(c)
+	a.mapSettingsView(c)
 	a.deleteView(c)
 	a.logoutView(c)
 	a.quitView(c)
@@ -710,9 +714,13 @@ func (a *app) header(c *ui.Context) {
 					if a.tunSwitch {
 						if pid := a.firstOnlinePoint(); pid != "" {
 							go a.startTUNSerialized(pid)
+						} else if a.hasMappings() {
+							// No access point, but port mappings are enough to
+							// bring TUN up in mapping-only mode.
+							go a.startTUNSerialized("")
 						} else {
 							a.tunPending = false
-							a.toast = "没有在线接入点，先登录再开 TUN"
+							a.toast = "没有在线接入点，先登录再开 TUN（或先在端口映射里配一条映射）"
 						}
 					} else {
 						go a.stopTUNSerialized()
@@ -721,8 +729,8 @@ func (a *app) header(c *ui.Context) {
 				}
 			}
 			ui.Row(c).Padding(6).Radius(8).AlignItems(ui.Center).
-				OnClick(a.openTUNLog).Tooltip("TUN 日志").Children(func() {
-				ui.Icon(c, logIcon).Size(16, 16)
+				OnClick(a.openMapSettings).Tooltip("端口映射 / TUN 日志").Children(func() {
+				ui.Icon(c, settingsIcon).Size(17, 17)
 			})
 			// Always shown, like the TUN switch: hidden controls make the app
 			// look broken. It is only disabled while the aggregate is down.
@@ -1459,6 +1467,169 @@ func (a *app) settingsView(c *ui.Context) {
 	})
 }
 
+// mapSettingsView is the port-mapping dialog opened from the header button:
+// a list of 目标IP/目标端口 -> 映射IP/映射端口 rows, plus the TUN log entry.
+func (a *app) mapSettingsView(c *ui.Context) {
+	d := &a.mapSettings
+	if !d.open {
+		return
+	}
+	t := c.Theme()
+	ui.Modal(c, &d.open, func() {
+		ui.Column(c).Width(600).Gap(10).Children(func() {
+			ui.Row(c).AlignItems(ui.Center).Justify(ui.SpaceBetween).Children(func() {
+				ui.Text(c, "端口映射").FontSize(18).Bold()
+				// The two log entries live in the dialog's top-right corner.
+				ui.Row(c).Gap(2).AlignItems(ui.Center).Children(func() {
+					iconButton(c, accessIcon, "访问日志", a.openAccessLog)
+					iconButton(c, logIcon, "TUN 日志", a.openTUNLog)
+				})
+			})
+			ui.Text(c, "把访问「目标 IP:端口」的 TCP 连接改接到本机「映射 IP:端口」，走普通网络（例如本机已开好的端口转发 / RustDesk 映射），不再经过隧道。仅开全局 TUN 时生效。").
+				FontSize(11).TextColor(t.TextMuted)
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "目标 IP").FontSize(11).TextColor(t.TextMuted).Width(110)
+				ui.Text(c, "端口").FontSize(11).TextColor(t.TextMuted).Width(64)
+				ui.Text(c, "映射 IP").FontSize(11).TextColor(t.TextMuted).Width(110)
+				ui.Text(c, "端口").FontSize(11).TextColor(t.TextMuted).Width(64)
+			})
+			ui.Scroll(c).Grow(1).Height(180).Children(func() {
+				ui.Column(c).Gap(6).Children(func() {
+					for i := range d.rows {
+						row := &d.rows[i]
+						ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+							ui.TextInput(c, &row.TargetIP).Placeholder("127.0.0.1").Width(110)
+							ui.TextInput(c, &row.TargetPort).Placeholder("8080").Width(64)
+							ui.Text(c, "→").FontSize(12).TextColor(t.TextMuted)
+							ui.TextInput(c, &row.LocalIP).Placeholder("127.0.0.1").Width(110)
+							ui.TextInput(c, &row.LocalPort).Placeholder("8080").Width(64)
+							idx := i
+							if ui.Button(c, "删除").FontSize(11).Clicked() {
+								d.rows = append(d.rows[:idx], d.rows[idx+1:]...)
+							}
+						})
+					}
+				})
+			})
+			if ui.Button(c, "＋ 添加一条映射").FontSize(12).Clicked() {
+				d.rows = append(d.rows, mapRow{LocalIP: "127.0.0.1"})
+			}
+			if d.err != "" {
+				ui.Text(c, d.err).FontSize(12).TextColor(t.Danger)
+			}
+			ui.Row(c).Gap(8).Justify(ui.End).Children(func() {
+				if ui.Button(c, "取消").Clicked() {
+					d.open = false
+				}
+				if ui.PrimaryButton(c, "保存").Clicked() {
+					a.saveMapSettings()
+				}
+			})
+		})
+	})
+}
+
+// openMapSettings loads the saved mappings into four-field rows.
+func (a *app) openMapSettings() {
+	d := &a.mapSettings
+	d.open = true
+	d.err = ""
+	d.rows = nil
+	for _, row := range mappingsToRows(a.cfg.Settings.LocalMappings) {
+		d.rows = append(d.rows, row)
+	}
+	// Start with one empty row so the dialog is usable straight away.
+	if len(d.rows) == 0 {
+		d.rows = []mapRow{{LocalIP: "127.0.0.1"}}
+	}
+}
+
+// saveMapSettings turns the rows back into the redirect table. Empty rows are
+// skipped; a partially filled row is an error so nothing is silently dropped.
+func (a *app) saveMapSettings() {
+	d := &a.mapSettings
+	table := map[string]string{}
+	for i, r := range d.rows {
+		tIP := strings.TrimSpace(r.TargetIP)
+		tPort := strings.TrimSpace(r.TargetPort)
+		lIP := strings.TrimSpace(r.LocalIP)
+		lPort := strings.TrimSpace(r.LocalPort)
+		if tIP == "" && tPort == "" && lIP == "" && lPort == "" {
+			continue // fully empty: ignore
+		}
+		if tIP == "" || lIP == "" || lPort == "" {
+			d.err = fmt.Sprintf("第 %d 条：目标 IP、映射 IP、映射端口都要填", i+1)
+			return
+		}
+		key, err := joinHostPort(tIP, tPort)
+		if err != nil {
+			d.err = fmt.Sprintf("第 %d 条：%v", i+1, err)
+			return
+		}
+		val, err := joinHostPort(lIP, lPort)
+		if err != nil || strings.Contains(val, ":") == false {
+			d.err = fmt.Sprintf("第 %d 条：映射端口无效", i+1)
+			return
+		}
+		table[key] = val
+	}
+	if _, err := a.store.Update(func(cfg *model.Config) error {
+		cfg.Settings.LocalMappings = table
+		return nil
+	}); err != nil {
+		d.err = err.Error()
+		return
+	}
+	if err := a.saveConfig(); err != nil {
+		d.err = "保存配置失败：" + err.Error()
+		return
+	}
+	d.open = false
+	a.toast = "端口映射已保存"
+}
+
+// joinHostPort builds "ip:port" (or just "ip" when port is blank) after
+// validating both halves, so a typo is caught at save time.
+func joinHostPort(ip, port string) (string, error) {
+	if net.ParseIP(ip) == nil {
+		return "", fmt.Errorf("不是有效 IP：%s", ip)
+	}
+	if port == "" {
+		return ip, nil
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n <= 0 || n > 65535 {
+		return "", fmt.Errorf("端口无效：%s", port)
+	}
+	return fmt.Sprintf("%s:%d", ip, n), nil
+}
+
+// mappingsToRows splits a redirect table into four-field rows, preserving a
+// stable order (sorted by key).
+func mappingsToRows(m map[string]string) []mapRow {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	rows := make([]mapRow, 0, len(keys))
+	for _, k := range keys {
+		tIP, tPort := k, ""
+		if h, p, err := net.SplitHostPort(k); err == nil {
+			tIP, tPort = h, p
+		}
+		lIP, lPort := m[k], ""
+		if h, p, err := net.SplitHostPort(m[k]); err == nil {
+			lIP, lPort = h, p
+		}
+		rows = append(rows, mapRow{TargetIP: tIP, TargetPort: tPort, LocalIP: lIP, LocalPort: lPort})
+	}
+	return rows
+}
+
 func (a *app) deleteView(c *ui.Context) {
 	if a.deleting == "" {
 		return
@@ -1929,6 +2100,19 @@ func (a *app) openTUNLog() {
 	}
 }
 
+// openAccessLog opens the helper's access log: one line per connection the TUN
+// carried.
+func (a *app) openAccessLog() {
+	path := a.accessLogPath()
+	if _, err := os.Stat(path); err != nil {
+		a.toast = "还没有访问日志（先开启一次全局 TUN）"
+		return
+	}
+	if err := mygo.Shell.OpenPath(path); err != nil {
+		a.toast = "打开访问日志失败：" + err.Error()
+	}
+}
+
 func (a *app) firstOnlinePoint() string {
 	for _, v := range a.mgr.Views() {
 		if v.State == vpn.StateOnline {
@@ -2151,4 +2335,79 @@ func appFilterValue(index int) string {
 // login lives in the app's own window and its files are not worth touching.
 func logoutClearsBrowser(mode model.AuthMode) bool {
 	return mode == model.AuthModeSSO
+}
+
+// parseRedirects turns the editor's multi-line text into a redirect map. Each
+// non-blank line is "目标 -> 本地", where 目标 is an IP ("210.76.17.0", any
+// port) or "IP:端口", and 本地 is a local "host:port" the connection should
+// actually reach over the plain network. The arrow also accepts "->" written
+// with any surrounding spaces, or a single "=".
+func parseRedirects(text string) (map[string]string, error) {
+	out := map[string]string{}
+	for i, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		sep := ""
+		switch {
+		case strings.Contains(line, "->"):
+			sep = "->"
+		case strings.Contains(line, "→"):
+			sep = "→"
+		case strings.Contains(line, "="):
+			sep = "="
+		default:
+			return nil, fmt.Errorf("第 %d 行缺少 -> （格式：目标 -> 本地）", i+1)
+		}
+		parts := strings.SplitN(line, sep, 2)
+		from := strings.TrimSpace(parts[0])
+		to := strings.TrimSpace(parts[1])
+		if from == "" || to == "" {
+			return nil, fmt.Errorf("第 %d 行的目标或本地为空", i+1)
+		}
+		// 目标必须是 IP 或 IP:端口。
+		host := from
+		if h, p, err := net.SplitHostPort(from); err == nil {
+			host = h
+			if n, perr := strconv.Atoi(p); perr != nil || n <= 0 || n > 65535 {
+				return nil, fmt.Errorf("第 %d 行端口无效：%s", i+1, from)
+			}
+		}
+		if net.ParseIP(host) == nil {
+			return nil, fmt.Errorf("第 %d 行目标不是有效 IP：%s", i+1, from)
+		}
+		// 本地必须带端口。
+		if _, _, err := net.SplitHostPort(to); err != nil {
+			return nil, fmt.Errorf("第 %d 行本地需要是 host:端口：%s", i+1, to)
+		}
+		out[from] = to
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// formatRedirects renders a redirect map back to the editor's line format,
+// sorted so the text is stable between openings.
+func formatRedirects(m map[string]string) string {
+	if len(m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(k)
+		b.WriteString(" -> ")
+		b.WriteString(m[k])
+	}
+	return b.String()
 }
