@@ -63,6 +63,20 @@ func Connect(ctx context.Context, point model.AccessPoint, creds vpn.Credentials
 		done:   make(chan struct{}),
 	}
 
+	// Keep the hub's data path warm with a real frame every few seconds.
+	go func() {
+		t := time.NewTicker(3 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-s.done:
+				return
+			case <-t.C:
+				_ = l2.PingGateway()
+			}
+		}
+	}()
+
 	// Pump frames into the stack.
 	go func() {
 		for {
@@ -104,6 +118,9 @@ func Connect(ctx context.Context, point model.AccessPoint, creds vpn.Credentials
 		info.NodeGroups = targets
 	}
 	s.info = info
+	if lease.Seconds > 0 {
+		fmt.Printf("SoftEther DHCP 租约 %d 秒\n", lease.Seconds)
+	}
 	return s, nil
 }
 

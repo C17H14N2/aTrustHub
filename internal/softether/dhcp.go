@@ -13,15 +13,18 @@ func dhcpDiscover(mac net.HardwareAddr) []byte {
 }
 
 // dhcpRequestMessage builds the REQUEST that confirms the offered address.
-func dhcpRequestMessage(mac net.HardwareAddr, offered net.IP) []byte {
+func dhcpRequestMessage(mac net.HardwareAddr, offered, serverID net.IP) []byte {
 	frame := dhcpRequest(mac, 3) // 3 = REQUEST
-	// Rewrite the payload with the requested-IP option so the server knows
-	// which offer is being accepted.
-	d := frame[len(frame)-300:]
-	// Trim the parameter list and rebuild options.
-	d = d[:240]
+	// Rebuild the payload with the requested address and the server identity
+	// the offer came from; a REQUEST without option 54 is ignored by most
+	// servers, which leaves the lease unconfirmed.
+	d := make([]byte, 240, 300)
+	copy(d, frame[len(frame)-300:len(frame)-300+240])
 	d = append(d, 53, 1, 3) // DHCP Request
 	d = append(d, 50, 4, offered[0], offered[1], offered[2], offered[3])
+	if serverID != nil {
+		d = append(d, 54, 4, serverID[0], serverID[1], serverID[2], serverID[3])
+	}
 	d = append(d, 55, 3, 1, 3, 6)
 	d = append(d, 255)
 	for len(d) < 300 {
@@ -135,6 +138,14 @@ func parseDHCP(frame []byte) (lease Lease, msgType byte, ok bool) {
 			if size >= 4 {
 				lease.GW = net.IPv4(v[0], v[1], v[2], v[3]).To4()
 			}
+		case 54:
+			if size >= 4 {
+				lease.ServerID = net.IPv4(v[0], v[1], v[2], v[3]).To4()
+			}
+		case 51:
+			if size >= 4 {
+				lease.Seconds = int(binary.BigEndian.Uint32(v[:4]))
+			}
 		case 121:
 			for j := 0; j+1 < len(v); {
 				width := int(v[j])
@@ -183,6 +194,7 @@ func (s *L2Stack) AcquireLease(mac net.HardwareAddr, timeout time.Duration) (Lea
 		select {
 		case <-deadline:
 			if offered.IP != nil {
+				fmt.Printf("DHCP 只收到 OFFER，没有 ACK（ip=%s）\n", offered.IP)
 				return offered, nil
 			}
 			return Lease{}, fmt.Errorf("等待 DHCP 响应超时")
@@ -195,13 +207,14 @@ func (s *L2Stack) AcquireLease(mac net.HardwareAddr, timeout time.Duration) (Lea
 			case 2: // OFFER
 				offered = lease
 				// Confirm the offer before returning.
-				if err := s.l2.write(dhcpRequestMessage(mac, lease.IP)); err != nil {
+				if err := s.l2.write(dhcpRequestMessage(mac, lease.IP, lease.ServerID)); err != nil {
 					return lease, nil
 				}
 			case 5: // ACK
-				if lease.IP == nil {
+				if lease.IP == nil || lease.IP.Equal(net.IPv4zero) {
 					lease = offered
 				}
+				fmt.Printf("DHCP ACK ip=%s server=%s\n", lease.IP, lease.ServerID)
 				return lease, nil
 			}
 		}

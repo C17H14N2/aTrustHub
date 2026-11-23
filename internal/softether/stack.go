@@ -35,10 +35,12 @@ type Route struct {
 
 // Lease is what the hub handed out.
 type Lease struct {
-	IP     net.IP
-	Prefix int
-	GW     net.IP
-	Routes []Route
+	IP      net.IP
+	Prefix  int
+	GW      net.IP
+	Routes   []Route
+	Seconds  int
+	ServerID net.IP
 }
 
 // L2Stack runs an Ethernet link over the tunnel inside gVisor, so the whole
@@ -52,6 +54,7 @@ type L2Stack struct {
 
 	mu   sync.Mutex
 	ip   tcpip.Address
+	gw   net.IP
 	routes []Route
 }
 
@@ -98,15 +101,18 @@ func (s *L2Stack) Configure(lease Lease) error {
 	if err := s.ns.AddProtocolAddress(nicID, protoAddr, stack.AddressProperties{}); err != nil {
 		return fmt.Errorf("配置地址失败：%s", err)
 	}
-	s.mu.Lock()
-	s.ip = addr
-	s.routes = append([]Route(nil), lease.Routes...)
-	s.mu.Unlock()
 
 	gw := lease.GW
 	if gw == nil && len(lease.Routes) > 0 {
 		gw = lease.Routes[0].GW
 	}
+
+	s.mu.Lock()
+	s.ip = addr
+	s.gw = gw
+	s.routes = append([]Route(nil), lease.Routes...)
+	s.mu.Unlock()
+
 	if gw != nil {
 		if mac, ok := s.arpResolve(addr, gw, 5*time.Second); ok {
 			s.ns.AddStaticNeighbor(nicID, ipv4.ProtocolNumber, tcpip.AddrFromSlice(gw.To4()), mac)
@@ -154,8 +160,23 @@ func (s *L2Stack) DialContext(ctx context.Context, network, addr string) (net.Co
 		// The tunnel has no resolver of its own; callers resolve first.
 		return nil, fmt.Errorf("SoftEther 隧道需要 IPv4 目标：%s", host)
 	}
+	s.mu.Lock()
+	src, gw := s.ip, s.gw
+	s.mu.Unlock()
 	full := tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFromSlice(ip), Port: uint16(port)}
-	return gonet.DialContextTCP(ctx, s.ns, full, ipv4.ProtocolNumber)
+
+	conn, err := gonet.DialContextTCP(ctx, s.ns, full, ipv4.ProtocolNumber)
+	if err == nil {
+		return conn, nil
+	}
+	// Retry once after refreshing the gateway entry.
+	if gw != nil && src != (tcpip.Address{}) {
+		if mac, ok := s.arpResolve(src, gw, 3*time.Second); ok {
+			s.ns.AddStaticNeighbor(nicID, ipv4.ProtocolNumber, tcpip.AddrFromSlice(gw.To4()), mac)
+			return gonet.DialContextTCP(ctx, s.ns, full, ipv4.ProtocolNumber)
+		}
+	}
+	return nil, err
 }
 
 // DialUDP opens a UDP socket through the user-space stack.
@@ -240,6 +261,30 @@ func (e *l2Endpoint) deliver(frame []byte) {
 	})
 	defer pkt.DecRef()
 	e.eth.DeliverNetworkPacket(0, pkt)
+}
+
+// PingGateway sends one ARP request for the gateway. A real frame keeps the
+// hub's data path alive in a way the control-stream keep-alive does not.
+func (s *L2Stack) PingGateway() error {
+	s.mu.Lock()
+	src, gw := s.ip, s.gw
+	s.mu.Unlock()
+	if gw == nil || src == (tcpip.Address{}) {
+		return nil
+	}
+	src4 := src.As4()
+	frame := make([]byte, 42)
+	copy(frame[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+	copy(frame[6:12], src4[:])
+	frame[12], frame[13] = 0x08, 0x06
+	frame[14], frame[15] = 0x00, 0x01
+	frame[16], frame[17] = 0x08, 0x00
+	frame[18], frame[19] = 6, 4
+	frame[20], frame[21] = 0x00, 0x01
+	copy(frame[22:28], src4[:])
+	copy(frame[28:32], src4[:])
+	binary.BigEndian.PutUint32(frame[38:], binary.BigEndian.Uint32(gw.To4()))
+	return s.l2.write(frame)
 }
 
 // arpResolve broadcasts an ARP request and waits for the reply.
