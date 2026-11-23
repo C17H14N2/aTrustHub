@@ -76,6 +76,17 @@ func main() {
 		}
 		defer hold.Close()
 		fmt.Println("held connection open")
+		// Keep the held connection talking, so the hub's 20s idle timer never
+		// fires: policy.TimeOut is 20 for this gateway.
+		go func() {
+			kt := time.NewTicker(5 * time.Second)
+			defer kt.Stop()
+			for range kt.C {
+				if _, err := hold.Write([]byte{0x00}); err != nil {
+					return
+				}
+			}
+		}()
 		tick := time.NewTicker(8 * time.Second)
 		defer tick.Stop()
 		for time.Now().Before(deadline) {

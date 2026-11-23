@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"os"
 	"errors"
 	"fmt"
 	"io"
@@ -36,12 +35,14 @@ type Config struct {
 // Nothing here touches the operating system: frames go in and out over the
 // TLS stream, and the L2 stack runs in user space.
 type Client struct {
-	// ctrl carries authentication and keep-alives; data carries Ethernet
-	// frames. The hub expects two: a single connection works for about
-	// thirty seconds and then silently stops forwarding new flows.
-	ctrl *mayaqua.Sock
-	data *mayaqua.Sock
-	cfg  Config
+	// ctrl carries authentication and keep-alives; data is the additional
+	// connection bound with additional_connect. The hub spreads tunnel frames
+	// across every bound connection, so both are read.
+	ctrl   *mayaqua.Sock
+	data   *mayaqua.Sock
+	frames chan []byte
+	readEr chan error
+	cfg    Config
 
 	writeMu sync.Mutex
 	closed  bool
@@ -140,7 +141,9 @@ func connectSync(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("SoftEther 认证被拒绝：%s", cedar.ErrorCode(code))
 	}
 
-	sessionName, connectionName, _ := cedar.ParseWelcomeFromPack(welcome)
+	sessionName, connectionName, policy := cedar.ParseWelcomeFromPack(welcome)
+	fmt.Printf("SoftEther 策略：TimeOut=%ds MaxConnection=%d MaxMac=%d MaxIP=%d MultiLogins=%d NoQoS=%v ArpDhcpOnly=%v\n",
+		policy.TimeOut, policy.MaxConnection, policy.MaxMac, policy.MaxIP, policy.MultiLogins, policy.NoQoS, policy.ArpDhcpOnly)
 	key, key32, err := cedar.GetSessionKeyFromPack(welcome)
 	if err != nil {
 		sock.Close()
@@ -163,15 +166,22 @@ func connectSync(cfg Config) (*Client, error) {
 	// answers it with EOF, so the data path shares the control connection.
 	/// Until that handshake is understood, one connection carries both.
 	dataSock := sock
-	if os.Getenv("SOFTETHER_DUAL") == "1" {
-		if second, derr := openDataChannel(&conn, cfg); derr == nil {
-			dataSock = second
-		} else {
-			fmt.Println("数据连接未建立，回退单连接：", derr)
-		}
+	connections := 1
+	if second, derr := openDataChannel(&conn, cfg); derr == nil {
+		dataSock = second
+		connections = 2
+	} else {
+		fmt.Println("数据连接未建立，回退单连接：", derr)
 	}
+	_ = connections
 
-	c := &Client{ctrl: sock, data: dataSock, cfg: cfg, done: make(chan struct{})}
+	c := &Client{
+		ctrl: sock, data: dataSock, cfg: cfg,
+		frames: make(chan []byte, 64),
+		readEr: make(chan error, 4),
+		done:   make(chan struct{}),
+	}
+	c.startReaders()
 	c.startKeepAlive()
 	return c, nil
 }
@@ -193,6 +203,18 @@ func openDataChannel(auth *cedar.Connection, cfg Config) (*mayaqua.Sock, error) 
 	sock, err := second.ClientConnectToServer()
 	if err != nil {
 		return nil, fmt.Errorf("建立数据连接失败：%w", err)
+	}
+
+	// The hub runs the same signature and hello exchange on every connection
+	// before it accepts additional_connect; skipping them yields EOF.
+	req0, err := second.ClientUploadSignature(sock)
+	if err != nil {
+		sock.Close()
+		return nil, fmt.Errorf("数据连接签名失败：%w", err)
+	}
+	if err := second.ClientDownloadHello(sock, req0); err != nil {
+		sock.Close()
+		return nil, fmt.Errorf("数据连接握手失败：%w", err)
 	}
 
 	pack := &mayaqua.Pack{}
@@ -258,11 +280,22 @@ func (c *Client) writeKeepAlive() error {
 	var hdr [8]byte
 	binary.BigEndian.PutUint32(hdr[0:], keepAliveMagic)
 	binary.BigEndian.PutUint32(hdr[4:], uint32(len(payload)))
-	if _, err := c.ctrl.Write(hdr[:]); err != nil {
-		return err
+	// Every bound connection gets the heartbeat: the hub counts activity per
+	// connection, and this gateway's policy timeout is 20 seconds.
+	seen := map[*mayaqua.Sock]bool{}
+	for _, sock := range []*mayaqua.Sock{c.ctrl, c.data} {
+		if sock == nil || seen[sock] {
+			continue
+		}
+		seen[sock] = true
+		if _, err := sock.Write(hdr[:]); err != nil {
+			return err
+		}
+		if _, err := sock.Write(payload); err != nil {
+			return err
+		}
 	}
-	_, err := c.ctrl.Write(payload)
-	return err
+	return nil
 }
 
 // Client version reported to the server. The official build numbers work
@@ -296,19 +329,59 @@ func (c *Client) WriteFrame(frame []byte) error {
 	return err
 }
 
-// ReadFrame returns the next Ethernet frame, skipping keep-alives.
+// startReaders pumps frames from every bound connection into one stream.
+func (c *Client) startReaders() {
+	conns := []*mayaqua.Sock{c.ctrl}
+	if c.data != nil && c.data != c.ctrl {
+		conns = append(conns, c.data)
+	}
+	for _, sock := range conns {
+		sock := sock
+		go func() {
+			for {
+				frame, err := readFrame(sock)
+				if err != nil {
+					select {
+					case c.readEr <- err:
+					default:
+					}
+					return
+				}
+				select {
+				case c.frames <- frame:
+				case <-c.done:
+					return
+				}
+			}
+		}()
+	}
+}
+
+// ReadFrame returns the next Ethernet frame from any connection.
 func (c *Client) ReadFrame() ([]byte, error) {
+	select {
+	case frame := <-c.frames:
+		return frame, nil
+	case err := <-c.readEr:
+		return nil, err
+	case <-c.done:
+		return nil, errors.New("SoftEther 连接已关闭")
+	}
+}
+
+// readFrame reads one record from a single connection, skipping keep-alives.
+func readFrame(conn *mayaqua.Sock) ([]byte, error) {
 	for {
 		var count uint32
-		if err := binary.Read(c.data, binary.BigEndian, &count); err != nil {
+		if err := binary.Read(conn, binary.BigEndian, &count); err != nil {
 			return nil, err
 		}
 		if count == keepAliveMagic {
 			var size uint32
-			if err := binary.Read(c.data, binary.BigEndian, &size); err != nil {
+			if err := binary.Read(conn, binary.BigEndian, &size); err != nil {
 				return nil, err
 			}
-			if _, err := io.CopyN(io.Discard, c.data, int64(size)); err != nil {
+			if _, err := io.CopyN(io.Discard, conn, int64(size)); err != nil {
 				return nil, err
 			}
 			continue
@@ -317,11 +390,11 @@ func (c *Client) ReadFrame() ([]byte, error) {
 			continue
 		}
 		var size uint32
-		if err := binary.Read(c.data, binary.BigEndian, &size); err != nil {
+		if err := binary.Read(conn, binary.BigEndian, &size); err != nil {
 			return nil, err
 		}
 		frame := make([]byte, size)
-		if _, err := io.ReadFull(c.data, frame); err != nil {
+		if _, err := io.ReadFull(conn, frame); err != nil {
 			return nil, err
 		}
 		// Records can carry several packets; this client never batches, so

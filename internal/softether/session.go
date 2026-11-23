@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/qy/easyconnect/internal/model"
@@ -28,6 +29,12 @@ type Session struct {
 	done      chan struct{}
 	errMu     sync.Mutex
 	err       error
+
+	// dialFails counts consecutive failed dials. The gateway's policy timeout
+	// is 20 seconds: once a session is older than that, fresh flows time out
+	// until it is rebuilt. Rebuilding is cheap (about half a second), so a few
+	// failures in a row are treated as a dead session.
+	dialFails atomic.Int32
 }
 
 // Connect logs in, leases an address and starts the frame pump.
@@ -121,6 +128,29 @@ func Connect(ctx context.Context, point model.AccessPoint, creds vpn.Credentials
 	if lease.Seconds > 0 {
 		fmt.Printf("SoftEther DHCP 租约 %d 秒\n", lease.Seconds)
 	}
+
+	// The hub's policy sets TimeOut=20: a session with no TCP activity for
+	// twenty seconds stops carrying new flows. A probe every eight seconds
+	// keeps it alive; it targets the first published network, so the target
+	// never has to answer.
+	if probe := probeAddress(lease); probe != "" {
+		go func() {
+			t := time.NewTicker(8 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-s.done:
+					return
+				case <-t.C:
+					ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+					if conn, err := s.Dial(ctx, "tcp", probe); err == nil {
+						_ = conn.Close()
+					}
+					cancel()
+				}
+			}
+		}()
+	}
 	return s, nil
 }
 
@@ -137,11 +167,27 @@ func (s *Session) Dial(ctx context.Context, network, addr string) (net.Conn, err
 		return nil, err
 	default:
 	}
+	var conn net.Conn
+	var err error
 	if network == "udp" || network == "udp4" {
-		return s.stack.DialUDP(ctx, addr)
+		conn, err = s.stack.DialUDP(ctx, addr)
+	} else {
+		conn, err = s.stack.DialContext(ctx, network, addr)
 	}
-	return s.stack.DialContext(ctx, network, addr)
+	if err != nil {
+		if s.dialFails.Add(1) >= maxDialFailures {
+			s.fail(fmt.Errorf("连续 %d 次建连失败，重建会话：%w", maxDialFailures, err))
+		}
+		return nil, err
+	}
+	s.dialFails.Store(0)
+	return conn, nil
 }
+
+// maxDialFailures is how many dials may fail in a row before the session is
+// rebuilt. One failure can be a closed port; several mean the tunnel stopped
+// carrying new flows.
+const maxDialFailures = 2
 
 // Info describes the session for the UI.
 func (s *Session) Info() vpn.SessionInfo { return s.info }
@@ -173,6 +219,23 @@ func (s *Session) fail(err error) {
 		_ = s.client.Close()
 		close(s.done)
 	})
+}
+
+// probeAddress picks a target for the session keep-alive: the first host of
+// the first published network, on a port nothing listens on.
+func probeAddress(lease Lease) string {
+	for _, r := range lease.Routes {
+		if r.Dest == nil {
+			continue
+		}
+		host := r.Dest
+		if r.Prefix < 32 {
+			host = append(net.IP(nil), r.Dest...)
+			host[3] = 1
+		}
+		return fmt.Sprintf("%s:1", host)
+	}
+	return ""
 }
 
 // appsFromCovers turns the user-defined boundary into the app list the
