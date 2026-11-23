@@ -19,3 +19,6 @@ resources/*/zju-connect-multitun.exe
 
 # 本地截图/临时产物
 .shots/
+
+# local build artifacts
+dist/

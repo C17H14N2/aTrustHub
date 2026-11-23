@@ -452,9 +452,13 @@ func calcXRequestSig(key []byte, data []byte) string {
 }
 
 func matchTCPIPResource(index *ipresource.Index, addr *net.TCPAddr) (client.IPResource, bool) {
-	return index.MatchLastWhere(addr.IP, "tcp", addr.Port, func(resource client.IPResource) bool {
+	// SPIKE: 优先匹配非 L3 优先的资源，但不再排除 EnableTCPPrefL3=true。
+	if resource, ok := index.MatchLastWhere(addr.IP, "tcp", addr.Port, func(resource client.IPResource) bool {
 		return !resource.EnableTCPPrefL3
-	})
+	}); ok {
+		return resource, true
+	}
+	return index.MatchLast(addr.IP, "tcp", addr.Port)
 }
 
 func tcpTunnelAuthDestinations(realDstHost string, port int, domain string, addrPretend bool) (destAddr, destIP string) {
@@ -497,9 +501,8 @@ func (c *Client) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, erro
 	domain := ""
 	addrPretend := true
 	if resource, ok := ctx.Value(resolve.ContextKeyDomainResource).(client.DomainResource); ok {
-		if resource.EnableTCPPrefL3 {
-			return nil, fmt.Errorf("host:%s port:%d prefers L3 tunnel: %w", addr.IP, addr.Port, client.ErrResourceNotFound)
-		}
+		// SPIKE: 不再因为 EnableTCPPrefL3=true 拒绝。这类资源在 L3 下会
+		// 因为认证请求不带 domain 被网关以 address check error 拒绝。
 		appID = resource.AppID
 		nodeGroupID = resource.NodeGroupID
 		if res := ctx.Value(resolve.ContextKeyResolveHost); res != nil {

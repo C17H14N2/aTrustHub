@@ -18,11 +18,20 @@ import (
 	zjuLog "github.com/mythologyli/zju-connect/log"
 	"github.com/mythologyli/zju-connect/resolve"
 	"github.com/mythologyli/zju-connect/service"
+	"github.com/mythologyli/zju-connect/stack"
 	"github.com/mythologyli/zju-connect/stack/gvisor"
+	"github.com/mythologyli/zju-connect/stack/tcptunnel"
 	"github.com/mythologyli/zju-connect/underlay"
 
 	"github.com/qy/easyconnect/internal/model"
 )
+
+// tcpTunnelMode 是 spike 开关：ATRUSTHUB_TCP_TUNNEL=1 时使用 aTrust TCP
+// 隧道栈。该模式只代理 TCP，全局 TUN 不可用。共享 IP 的域名资源必须走它，
+// 因为 L3 认证请求不带 domain，网关会以 address check error 拒绝。
+func tcpTunnelMode() bool {
+	return os.Getenv("ATRUSTHUB_TCP_TUNNEL") == "1"
+}
 
 // ZJUOptions configure the ZJU-Connect backed connector.
 type ZJUOptions struct {
@@ -200,9 +209,22 @@ func connectZJU(ctx context.Context, opts ZJUOptions, point model.AccessPoint, c
 		secondary = dnsServers[1]
 	}
 
-	vpnStack, err := gvisor.NewStack(client)
-	if err != nil {
-		return nil, fmt.Errorf("创建 gVisor 网络栈：%w", err)
+	// SPIKE: ATRUSTHUB_TCP_TUNNEL=1 时改用 aTrust TCP 隧道栈（只支持 TCP，
+	// 不能开全局 TUN）。用于共享 IP 的域名资源：L3 认证不带 domain，网关会拒。
+	var vpnStack stack.Stack
+	if tcpTunnelMode() {
+		ts, terr := tcptunnel.NewStack(client)
+		if terr != nil {
+			return nil, fmt.Errorf("创建 TCP 隧道栈：%w", terr)
+		}
+		vpnStack = ts
+		zjuLog.Printf("已启用 TCP 隧道模式（spike）")
+	} else {
+		gs, gerr := gvisor.NewStack(client)
+		if gerr != nil {
+			return nil, fmt.Errorf("创建 gVisor 网络栈：%w", gerr)
+		}
+		vpnStack = gs
 	}
 	resolver := resolve.NewResolver(
 		vpnStack, remoteDNS, secondary, opts.DNSTTL,
@@ -228,15 +250,18 @@ func connectZJU(ctx context.Context, opts ZJUOptions, point model.AccessPoint, c
 	sess.info.BestNodes = bestNodes(client)
 	sess.info.NodeGroups = nodeGroups(client)
 	sess.info.Apps = appsFromZJU(client.Apps())
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				sess.fail(fmt.Errorf("VPN 数据通道中断：%v", r))
-			}
+	// TCP 隧道栈的 Run 是空实现，不能拿它当存活信号。
+	if gs, ok := vpnStack.(*gvisor.Stack); ok {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					sess.fail(fmt.Errorf("VPN 数据通道中断：%v", r))
+				}
+			}()
+			gs.Run()
+			sess.fail(errors.New("VPN 数据通道已关闭"))
 		}()
-		vpnStack.Run()
-		sess.fail(errors.New("VPN 数据通道已关闭"))
-	}()
+	}
 
 	cleanupUnderlay = false
 	cleanupClient = false
@@ -246,7 +271,7 @@ func connectZJU(ctx context.Context, opts ZJUOptions, point model.AccessPoint, c
 type zjuSession struct {
 	client   *atrustclient.Client
 	underlay *underlay.Dialer
-	stack    *gvisor.Stack
+	stack    stack.Stack
 	resolver *resolve.Resolver
 	dialer   *dial.Dialer
 
