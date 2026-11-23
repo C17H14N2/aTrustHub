@@ -137,3 +137,51 @@ func TestProcessIPV4RedirectWithoutPool(t *testing.T) {
 		t.Fatal("重定向规则未命中")
 	}
 }
+
+// 映射连接必须写进访问日志，并带上映射到本机哪个地址。
+func TestRedirectLogsAccessVia(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		c.Close()
+	}()
+
+	type rec struct {
+		target string
+		port   int
+		ok     bool
+		via    string
+	}
+	got := make(chan rec, 1)
+
+	s := &Stack{}
+	s.SetupRedirects(map[string]string{"210.76.17.0:3306": ln.Addr().String()})
+	s.AccessLogVia = func(target string, port int, ok bool, via string) {
+		select {
+		case got <- rec{target, port, ok, via}:
+		default:
+		}
+	}
+
+	clientSide, serverSide := net.Pipe()
+	go s.handleInboundConn(serverSide, "210.76.17.0", 3306)
+	_ = clientSide.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = clientSide.Write([]byte("x"))
+
+	select {
+	case r := <-got:
+		if r.target != "210.76.17.0" || r.port != 3306 || !r.ok || r.via != ln.Addr().String() {
+			t.Fatalf("访问日志记录 = %+v，想要 target=210.76.17.0 port=3306 ok=true via=%s", r, ln.Addr())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("映射连接没有写进访问日志")
+	}
+	_ = clientSide.Close()
+}

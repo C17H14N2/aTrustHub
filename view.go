@@ -1485,9 +1485,8 @@ func (a *app) mapSettingsView(c *ui.Context) {
 					iconButton(c, logIcon, "TUN 日志", a.openTUNLog)
 				})
 			})
-			ui.Text(c, "把访问「目标 IP:端口」的 TCP 连接改接到本机「映射 IP:端口」，走普通网络（例如本机已开好的端口转发 / RustDesk 映射），不再经过隧道。仅开全局 TUN 时生效。").
-				FontSize(11).TextColor(t.TextMuted)
 			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "启用").FontSize(11).TextColor(t.TextMuted).Width(40)
 				ui.Text(c, "目标 IP").FontSize(11).TextColor(t.TextMuted).Width(110)
 				ui.Text(c, "端口").FontSize(11).TextColor(t.TextMuted).Width(64)
 				ui.Text(c, "映射 IP").FontSize(11).TextColor(t.TextMuted).Width(110)
@@ -1498,6 +1497,10 @@ func (a *app) mapSettingsView(c *ui.Context) {
 					for i := range d.rows {
 						row := &d.rows[i]
 						ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+							// 这一行自己的开关：关掉只是不生效，值仍然保留。
+							ui.Row(c).Width(40).AlignItems(ui.Center).Children(func() {
+								ui.Switch(c, &row.Enabled)
+							})
 							ui.TextInput(c, &row.TargetIP).Placeholder("127.0.0.1").Width(110)
 							ui.TextInput(c, &row.TargetPort).Placeholder("8080").Width(64)
 							ui.Text(c, "→").FontSize(12).TextColor(t.TextMuted)
@@ -1512,7 +1515,7 @@ func (a *app) mapSettingsView(c *ui.Context) {
 				})
 			})
 			if ui.Button(c, "＋ 添加一条映射").FontSize(12).Clicked() {
-				d.rows = append(d.rows, mapRow{LocalIP: "127.0.0.1"})
+				d.rows = append(d.rows, mapRow{Enabled: true, LocalIP: "127.0.0.1"})
 			}
 			if d.err != "" {
 				ui.Text(c, d.err).FontSize(12).TextColor(t.Danger)
@@ -1535,12 +1538,11 @@ func (a *app) openMapSettings() {
 	d.open = true
 	d.err = ""
 	d.rows = nil
-	for _, row := range mappingsToRows(a.cfg.Settings.LocalMappings) {
-		d.rows = append(d.rows, row)
-	}
+	d.rows = append(d.rows, mappingsToRows(
+		a.cfg.Settings.LocalMappings, a.cfg.Settings.DisabledMappings)...)
 	// Start with one empty row so the dialog is usable straight away.
 	if len(d.rows) == 0 {
-		d.rows = []mapRow{{LocalIP: "127.0.0.1"}}
+		d.rows = []mapRow{{Enabled: true, LocalIP: "127.0.0.1"}}
 	}
 }
 
@@ -1548,7 +1550,8 @@ func (a *app) openMapSettings() {
 // skipped; a partially filled row is an error so nothing is silently dropped.
 func (a *app) saveMapSettings() {
 	d := &a.mapSettings
-	table := map[string]string{}
+	enabled := map[string]string{}
+	disabled := map[string]string{}
 	for i, r := range d.rows {
 		tIP := strings.TrimSpace(r.TargetIP)
 		tPort := strings.TrimSpace(r.TargetPort)
@@ -1571,10 +1574,15 @@ func (a *app) saveMapSettings() {
 			d.err = fmt.Sprintf("第 %d 条：映射端口无效", i+1)
 			return
 		}
-		table[key] = val
+		if r.Enabled {
+			enabled[key] = val
+		} else {
+			disabled[key] = val
+		}
 	}
 	if _, err := a.store.Update(func(cfg *model.Config) error {
-		cfg.Settings.LocalMappings = table
+		cfg.Settings.LocalMappings = enabled
+		cfg.Settings.DisabledMappings = disabled
 		return nil
 	}); err != nil {
 		d.err = err.Error()
@@ -1585,7 +1593,11 @@ func (a *app) saveMapSettings() {
 		return
 	}
 	d.open = false
-	a.toast = "端口映射已保存"
+	if n := len(enabled); n > 0 {
+		a.toast = fmt.Sprintf("端口映射已保存，%d 条生效", n)
+	} else {
+		a.toast = "端口映射已保存，当前没有启用的映射"
+	}
 }
 
 // joinHostPort builds "ip:port" (or just "ip" when port is blank) after
@@ -1606,27 +1618,32 @@ func joinHostPort(ip, port string) (string, error) {
 
 // mappingsToRows splits a redirect table into four-field rows, preserving a
 // stable order (sorted by key).
-func mappingsToRows(m map[string]string) []mapRow {
-	if len(m) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	rows := make([]mapRow, 0, len(keys))
-	for _, k := range keys {
-		tIP, tPort := k, ""
-		if h, p, err := net.SplitHostPort(k); err == nil {
-			tIP, tPort = h, p
+func mappingsToRows(enabled, disabled map[string]string) []mapRow {
+	rows := make([]mapRow, 0, len(enabled)+len(disabled))
+	add := func(m map[string]string, on bool) {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
 		}
-		lIP, lPort := m[k], ""
-		if h, p, err := net.SplitHostPort(m[k]); err == nil {
-			lIP, lPort = h, p
+		sort.Strings(keys)
+		for _, k := range keys {
+			tIP, tPort := k, ""
+			if h, p, err := net.SplitHostPort(k); err == nil {
+				tIP, tPort = h, p
+			}
+			lIP, lPort := m[k], ""
+			if h, p, err := net.SplitHostPort(m[k]); err == nil {
+				lIP, lPort = h, p
+			}
+			rows = append(rows, mapRow{
+				Enabled: on, TargetIP: tIP, TargetPort: tPort,
+				LocalIP: lIP, LocalPort: lPort,
+			})
 		}
-		rows = append(rows, mapRow{TargetIP: tIP, TargetPort: tPort, LocalIP: lIP, LocalPort: lPort})
 	}
+	// Enabled rows first: the active set is what the user cares about.
+	add(enabled, true)
+	add(disabled, false)
 	return rows
 }
 

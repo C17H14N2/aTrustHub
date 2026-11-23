@@ -1,6 +1,8 @@
 package main
 
 import (
+	"github.com/egoist/mygo/ui"
+
 	"github.com/qy/easyconnect/internal/model"
 	"github.com/qy/easyconnect/internal/vpn"
 	"os"
@@ -262,7 +264,7 @@ func TestSaveMapSettingsRows(t *testing.T) {
 	a := testApp(t)
 	a.openMapSettings()
 	a.mapSettings.rows = []mapRow{
-		{TargetIP: "210.76.17.0", TargetPort: "3306", LocalIP: "127.0.0.1", LocalPort: "33060"},
+		{Enabled: true, TargetIP: "210.76.17.0", TargetPort: "3306", LocalIP: "127.0.0.1", LocalPort: "33060"},
 	}
 	a.saveMapSettings()
 	if a.mapSettings.err != "" {
@@ -298,6 +300,52 @@ func TestSaveMapSettingsRows(t *testing.T) {
 	}
 	if len(a.store.Config().Settings.LocalMappings) != 0 {
 		t.Fatalf("不该有映射: %v", a.store.Config().Settings.LocalMappings)
+	}
+}
+
+// 关掉的映射不生效，但值保留，重新打开后回到生效集合。
+func TestMapSettingsToggleEnabled(t *testing.T) {
+	a := testApp(t)
+	a.openMapSettings()
+	a.mapSettings.rows = []mapRow{
+		{Enabled: true, TargetIP: "10.0.0.1", TargetPort: "5432", LocalIP: "127.0.0.1", LocalPort: "15432"},
+		{Enabled: false, TargetIP: "10.0.0.2", TargetPort: "6379", LocalIP: "127.0.0.1", LocalPort: "16379"},
+	}
+	a.saveMapSettings()
+	if a.mapSettings.err != "" {
+		t.Fatalf("save: %s", a.mapSettings.err)
+	}
+	s := a.store.Config().Settings
+	if len(s.LocalMappings) != 1 || s.LocalMappings["10.0.0.1:5432"] != "127.0.0.1:15432" {
+		t.Fatalf("启用的映射 = %v", s.LocalMappings)
+	}
+	if len(s.DisabledMappings) != 1 || s.DisabledMappings["10.0.0.2:6379"] != "127.0.0.1:16379" {
+		t.Fatalf("停用的映射 = %v", s.DisabledMappings)
+	}
+
+	// 重新打开：两条都回显，开关状态正确。
+	a.openMapSettings()
+	if len(a.mapSettings.rows) != 2 {
+		t.Fatalf("应回显 2 条，got %d: %+v", len(a.mapSettings.rows), a.mapSettings.rows)
+	}
+	on := 0
+	for _, r := range a.mapSettings.rows {
+		if r.Enabled {
+			on++
+		}
+	}
+	if on != 1 {
+		t.Fatalf("启用条数 = %d，想要 1（rows=%+v）", on, a.mapSettings.rows)
+	}
+
+	// 把停用的那条打开，保存后应进入生效集合。
+	for i := range a.mapSettings.rows {
+		a.mapSettings.rows[i].Enabled = true
+	}
+	a.saveMapSettings()
+	s = a.store.Config().Settings
+	if len(s.LocalMappings) != 2 || len(s.DisabledMappings) != 0 {
+		t.Fatalf("全开之后 = %v / %v", s.LocalMappings, s.DisabledMappings)
 	}
 }
 
@@ -359,5 +407,22 @@ func TestPublishAccessShowsMapping(t *testing.T) {
 			lines = append(lines, e.Line)
 		}
 		t.Fatalf("访问日志缺少映射记录；现有 = %v", lines)
+	}
+}
+
+// 端口映射弹窗必须有「启用」列（每行的开关），否则用户看不到开关。
+func TestMapSettingsDialogHasEnableColumn(t *testing.T) {
+	a := testApp(t)
+	a.openMapSettings()
+	tt := ui.NewTester(a.mapSettingsView, 660, 540)
+	texts := strings.Join(tt.Texts(), "|")
+	for _, want := range []string{"端口映射", "启用", "目标 IP", "映射 IP", "添加一条映射"} {
+		if !strings.Contains(texts, want) {
+			t.Errorf("弹窗缺少 %q；texts = %s", want, texts)
+		}
+	}
+	// 默认会有一条空行，且默认启用。
+	if len(a.mapSettings.rows) != 1 || !a.mapSettings.rows[0].Enabled {
+		t.Fatalf("默认行应启用：%+v", a.mapSettings.rows)
 	}
 }

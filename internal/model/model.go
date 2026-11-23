@@ -236,6 +236,9 @@ type Settings struct {
 	// when a remote host must go through a local TCP tunnel (e.g. RustDesk
 	// maps 210.76.17.0:3306 to 127.0.0.1:33060 locally).
 	LocalMappings map[string]string `json:"localMappings,omitempty"`
+	// DisabledMappings keeps the mappings the user switched off. They are not
+	// installed, but their values survive so they can be turned back on.
+	DisabledMappings map[string]string `json:"disabledMappings,omitempty"`
 	// AutoLoginOptIn records that the user has been offered the auto-login
 	// default. Access points do not log in at startup unless they ask for it.
 	AutoLoginOptIn bool `json:"autoLoginOptIn"`

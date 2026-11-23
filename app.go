@@ -197,8 +197,10 @@ type settingsDraft struct {
 }
 
 // mapRow is one port-mapping row in the mapping dialog: four inputs, so the
-// user never types the "目标 -> 本地" syntax by hand.
+// user never types the "目标 -> 本地" syntax by hand. Enabled is the row's own
+// switch: a disabled row keeps its values but is not installed.
 type mapRow struct {
+	Enabled    bool
 	TargetIP   string
 	TargetPort string
 	LocalIP    string

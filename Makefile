@@ -61,6 +61,24 @@ build:
 build-debug:
 	$(GO) tool mygo build -skip-dmg -debug
 
+## install: 编好并覆盖安装到 /Applications，然后启动（一条命令刷新你正在用的 App）
+##  应用有单实例锁：这里先退出正在运行的实例，否则 open 只会激活旧窗口。
+install: helpers build
+	-osascript -e 'quit app "aTrustHub"' 2>/dev/null || true
+	sleep 1
+	rm -rf /Applications/aTrustHub.app
+	cp -R build/darwin-arm64/aTrustHub.app /Applications/
+	open /Applications/aTrustHub.app
+	@echo "已安装并启动：/Applications/aTrustHub.app"
+
+## refresh: 同 install，但只重启「本地 build」里的那份，不动 /Applications
+##  适合不想覆盖安装、直接从仓库目录跑的场景。
+refresh: helpers build
+	-osascript -e 'quit app "aTrustHub"' 2>/dev/null || true
+	sleep 1
+	open build/darwin-arm64/aTrustHub.app
+	@echo "已启动本地构建：build/darwin-arm64/aTrustHub.app"
+
 ## dmg: 打包并生成磁盘映像（macOS）
 dmg:
 	$(GO) tool mygo build

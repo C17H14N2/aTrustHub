@@ -441,6 +441,8 @@ func startPoint(pc pointConfig, accessLog string, index int) (*point, error) {
 	if accessLog != "" {
 		logger := &accessLogger{path: accessLog, point: pc.Name}
 		st.AccessLog = logger.log
+		// Redirected connections also carry where the mapping sent them.
+		st.AccessLogVia = logger.logVia
 	}
 
 	go st.Run()
