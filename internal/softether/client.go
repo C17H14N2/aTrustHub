@@ -165,15 +165,9 @@ func connectSync(cfg Config) (*Client, error) {
 	// A second connection can be bound with additional_connect, but this hub
 	// answers it with EOF, so the data path shares the control connection.
 	/// Until that handshake is understood, one connection carries both.
+	// One connection, as the official client uses. additional_connect is only
+	// meaningful when max_connection > 1.
 	dataSock := sock
-	connections := 1
-	if second, derr := openDataChannel(&conn, cfg); derr == nil {
-		dataSock = second
-		connections = 2
-	} else {
-		fmt.Println("数据连接未建立，回退单连接：", derr)
-	}
-	_ = connections
 
 	c := &Client{
 		ctrl: sock, data: dataSock, cfg: cfg,
@@ -307,10 +301,10 @@ const (
 
 const clientString = "SoftEther VPN Client"
 
-// maxConnections is how many concurrent TCP streams the tunnel announces.
-// The hub honours this as a hard ceiling: with 1, every dial after the first
-// times out even though the session itself is healthy.
-const maxConnections = 32
+// maxConnections matches the official client's default: one TCP connection
+// carries the whole tunnel. Announcing more makes the hub expect that many
+// sockets and penalise the session when they never appear.
+const maxConnections = 1
 
 // WriteFrame sends one Ethernet frame.
 func (c *Client) WriteFrame(frame []byte) error {
