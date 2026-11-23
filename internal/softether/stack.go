@@ -253,18 +253,27 @@ func (e *l2Endpoint) WritePackets(list stack.PacketBufferList) (int, tcpip.Error
 
 // deliver passes a received frame to the ethernet endpoint. The endpoint
 // consumes the link header itself, so the frame stays whole in the payload.
+//
+// It must never block: it runs on the tunnel reader, and a stall here stops
+// reads, fills the TCP window and makes the hub stop sending. Slow deliveries
+// are logged so a regression is visible.
 func (e *l2Endpoint) deliver(frame []byte) {
-	if e.tap != nil {
-		e.tap(frame)
-	}
 	if e.eth == nil || !e.eth.IsAttached() {
 		return
 	}
+	if e.tap != nil {
+		e.tap(frame)
+	}
+	start := time.Now()
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData(frame),
 	})
 	defer pkt.DecRef()
 	e.eth.DeliverNetworkPacket(0, pkt)
+	if d := time.Since(start); d > 200*time.Millisecond {
+		fmt.Printf("deliver slow: %s (%d bytes, ethertype=0x%02x%02x)\n",
+			d.Round(time.Millisecond), len(frame), frame[12], frame[13])
+	}
 }
 
 

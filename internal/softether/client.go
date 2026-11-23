@@ -354,8 +354,9 @@ func (c *Client) startReaders() {
 	for _, sock := range conns {
 		sock := sock
 		go func() {
+			var pending [][]byte
 			for {
-				frame, err := readFrame(sock)
+				frame, err := readFrame(sock, &pending)
 				if err != nil {
 					select {
 					case c.readEr <- err:
@@ -393,7 +394,16 @@ func (c *Client) ReadFrame() ([]byte, error) {
 }
 
 // readFrame reads one record from a single connection, skipping keep-alives.
-func readFrame(conn *mayaqua.Sock) ([]byte, error) {
+func readFrame(conn *mayaqua.Sock, pending *[][]byte) ([]byte, error) {
+	// A block carries num_data packets (Connection.c: num_data = q->num_item,
+	// then one size+payload pair per packet). Every packet must be consumed,
+	// otherwise the next read mistakes a payload length for a packet count and
+	// the whole stream desynchronises.
+	if len(*pending) > 0 {
+		frame := (*pending)[0]
+		*pending = (*pending)[1:]
+		return frame, nil
+	}
 	for {
 		var count uint32
 		if err := binary.Read(conn, binary.BigEndian, &count); err != nil {
@@ -412,19 +422,37 @@ func readFrame(conn *mayaqua.Sock) ([]byte, error) {
 		if count == 0 {
 			continue
 		}
-		var size uint32
-		if err := binary.Read(conn, binary.BigEndian, &size); err != nil {
-			return nil, err
+		if count > maxPacketsPerBlock {
+			return nil, fmt.Errorf("SoftEther 块内包数异常：%d", count)
 		}
-		frame := make([]byte, size)
-		if _, err := io.ReadFull(conn, frame); err != nil {
-			return nil, err
+		for i := uint32(0); i < count; i++ {
+			var size uint32
+			if err := binary.Read(conn, binary.BigEndian, &size); err != nil {
+				return nil, err
+			}
+			if size > maxPacketSize {
+				return nil, fmt.Errorf("SoftEther 包长异常：%d", size)
+			}
+			frame := make([]byte, size)
+			if _, err := io.ReadFull(conn, frame); err != nil {
+				return nil, err
+			}
+			*pending = append(*pending, frame)
 		}
-		// Records can carry several packets; this client never batches, so
-		// anything beyond the first is dropped rather than misframed.
-		return frame, nil
+		if len(*pending) > 0 {
+			frame := (*pending)[0]
+			*pending = (*pending)[1:]
+			return frame, nil
+		}
 	}
 }
+
+// Bounds taken from the reference implementation: MAX_PACKET_SIZE * 2 is the
+// largest block payload it accepts, and a block holds a bounded queue.
+const (
+	maxPacketSize      = 1600 * 2
+	maxPacketsPerBlock = 1024
+)
 
 // FramesIn reports how many frames the hub has sent on this tunnel.
 func (c *Client) FramesIn() int64 { return c.framesIn.Load() }
