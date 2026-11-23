@@ -155,6 +155,7 @@ type app struct {
 type editorDraft struct {
 	open          bool
 	editingID     string
+	kindLabel     string
 	name          string
 	address       string
 	username      string
@@ -163,6 +164,7 @@ type editorDraft struct {
 	cred          string
 	totp          string
 	domain        string
+	covers        string
 	socksPort     string
 	inPool        bool
 	autoConnect   bool
@@ -312,10 +314,13 @@ func newApp() (*app, error) {
 	a.tunWanted = a.cfg.Settings.TunEnabled
 	a.bus.Add("app", fmt.Sprintf("aTrust Hub %s 启动，数据目录 %s", appBuild, dir))
 	a.mgr = vpn.NewManager(
-		vpn.NewZJUConnector(vpn.ZJUOptions{
-			DataDir: dir,
-			Debug:   os.Getenv("EASYCONNECT_DEBUG") != "",
-		}),
+		[]vpn.Backend{
+			vpn.NewBackend(model.KindATrust, vpn.NewZJUConnector(vpn.ZJUOptions{
+				DataDir: dir,
+				Debug:   os.Getenv("EASYCONNECT_DEBUG") != "",
+			})),
+			vpn.NewSocks5Backend(),
+		},
 		a.credentials,
 		a.bus,
 		a.invalidate,

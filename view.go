@@ -1235,6 +1235,41 @@ func authModeLabels() []string {
 	return out
 }
 
+// pointKindLabels name the backend kinds offered by the editor.
+func pointKindLabels() []string {
+	return []string{"aTrust 零信任", "外部 SOCKS5（过渡）"}
+}
+
+func pointKindFromLabel(label string) string {
+	if label == pointKindLabels()[1] {
+		return model.KindSocks5
+	}
+	return model.KindATrust
+}
+
+func pointKindLabel(kind string) string {
+	if kind == model.KindSocks5 {
+		return pointKindLabels()[1]
+	}
+	return pointKindLabels()[0]
+}
+
+// editorAddress renders the stored server/port the way the editor shows it.
+func editorAddress(p *model.AccessPoint) string {
+	if !p.IsATrust() {
+		return net.JoinHostPort(p.Server, strconv.Itoa(p.Port))
+	}
+	return model.FormatAccessAddress(p.Server, p.Port)
+}
+
+// splitCovers accepts commas, semicolons and whitespace between entries.
+func splitCovers(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\t' || r == ' '
+	})
+	return model.NormalizeCovers(fields)
+}
+
 func authModeFromLabel(label string) model.AuthMode {
 	for _, entry := range model.AuthModeLabels {
 		if entry.Label == label {
@@ -1295,8 +1330,36 @@ func (a *app) editorView(c *ui.Context) {
 			ui.Field(c, "名称", func() {
 				ui.TextInput(c, &d.name).Placeholder("例如：主网关 / 教育网线路")
 			})
-			// 接入地址先填，检测按钮紧跟着它，点检测时地址已经在上方。
-			ui.Field(c, "接入地址", func() {
+			ui.Field(c, "类型", func() {
+				ui.Select(c, &d.kindLabel, pointKindLabels()).Width(220)
+			})
+			if pointKindFromLabel(d.kindLabel) == model.KindSocks5 {
+				ui.Field(c, "代理地址", func() {
+					ui.TextInput(c, &d.address).
+						Placeholder("例如：127.0.0.1:7899").Grow(1)
+				})
+				ui.Row(c).Gap(10).AlignItems(ui.End).Children(func() {
+					ui.Field(c, "用户名（可选）", func() {
+						ui.TextInput(c, &d.username).Placeholder("SOCKS5 认证用户名")
+					})
+					ui.Field(c, "密码（可选）", func() {
+						in := ui.TextInput(c, &d.cred).Password().Grow(1)
+						if d.hasPassword {
+							in.Placeholder("已保存，留空则沿用")
+						} else {
+							in.Placeholder("SOCKS5 认证密码")
+						}
+					})
+				})
+				ui.Field(c, "应用边界", func() {
+					ui.TextInput(c, &d.covers).
+						Placeholder("逗号分隔，如 172.33.64.0/24, 172.32.0.16/32, app.example.com")
+				})
+				ui.Text(c, "只有命中这份边界的流量才会交给这个接入点，支持 CIDR、IP 区间和完整域名。").
+					FontSize(11).TextColor(t.TextMuted)
+			} else {
+				// 接入地址先填，检测按钮紧跟着它，点检测时地址已经在上方。
+				ui.Field(c, "接入地址", func() {
 				ui.TextInput(c, &d.address).
 					Placeholder("例如：https://vpn.example.com:443").Grow(1)
 			})
@@ -1357,6 +1420,7 @@ func (a *app) editorView(c *ui.Context) {
 					ui.Checkbox(c, &d.clearTOTP, "清除已保存的 TOTP 密钥")
 				}
 			}
+			}
 			ui.Field(c, "密码存储方式", func() {
 				ui.Select(c, &d.secretStore, secretStoreLabels()).Width(220)
 			})
@@ -1373,8 +1437,9 @@ func (a *app) editorView(c *ui.Context) {
 					ui.Checkbox(c, &d.autoConnect, "应用启动时自动登录")
 				})
 			})
-			ui.Row(c).Gap(14).AlignItems(ui.Center).Children(func() {
-				ui.Checkbox(c, &d.monitor, "监测会话是否仍有效")
+			if pointKindFromLabel(d.kindLabel) == model.KindATrust {
+				ui.Row(c).Gap(14).AlignItems(ui.Center).Children(func() {
+					ui.Checkbox(c, &d.monitor, "监测会话是否仍有效")
 				if d.monitor {
 					// Label and box on one line: the stacked field wrapped the
 					// caption onto two lines and looked out of place here.
@@ -1382,8 +1447,9 @@ func (a *app) editorView(c *ui.Context) {
 						ui.Text(c, "监测间隔（秒）").FontSize(12)
 						ui.TextInput(c, &d.monitorEvery).Width(90)
 					})
-				}
-			})
+					}
+				})
+			}
 			if d.err != "" {
 				ui.Text(c, d.err).FontSize(12).TextColor(t.Danger)
 			}
@@ -1819,6 +1885,7 @@ func (a *app) quitView(c *ui.Context) {
 func (a *app) openNewEditor() {
 	a.editor = editorDraft{
 		open:          true,
+		kindLabel:     pointKindLabel(model.KindATrust),
 		address:       "",
 		authMode:      string(model.AuthModePassword),
 		authModeLabel: model.AuthModePassword.Label(),
@@ -1849,12 +1916,14 @@ func (a *app) openEditor(v vpn.View) {
 	a.editor = editorDraft{
 		open:          true,
 		editingID:     p.ID,
+		kindLabel:     pointKindLabel(p.Kind),
 		name:          p.Name,
-		address:       model.FormatAccessAddress(p.Server, p.Port),
+		address:       editorAddress(p),
 		username:      p.Username,
 		authMode:      string(mode),
 		authModeLabel: mode.Label(),
 		domain:        p.LoginDomain,
+		covers:        strings.Join(p.Covers, ", "),
 		socksPort:     strconv.Itoa(p.SocksPort),
 		inPool:        p.InPool,
 		autoConnect:   p.AutoConnect,
@@ -1868,7 +1937,8 @@ func (a *app) openEditor(v vpn.View) {
 	// A point saved before the mode was a choice gets the mode the server
 	// actually offers, picked by detection instead of a "detect yourself"
 	// dropdown entry.
-	if strings.TrimSpace(p.AuthMode) == "" || model.AuthMode(p.AuthMode) == model.AuthModeAuto {
+	if p.IsATrust() &&
+		(strings.TrimSpace(p.AuthMode) == "" || model.AuthMode(p.AuthMode) == model.AuthModeAuto) {
 		a.editor.autoPick = true
 	}
 	if a.editor.autoPick {
@@ -1892,11 +1962,13 @@ func (a *app) saveEditor() {
 		d.err = "服务器地址不能为空"
 		return
 	}
+	kind := pointKindFromLabel(d.kindLabel)
 	mode := string(authModeFromLabel(d.authModeLabel))
 	if mode == "" {
 		mode = d.authMode
 	}
-	switch model.AuthMode(mode) {
+	if kind == model.KindATrust {
+		switch model.AuthMode(mode) {
 	case model.AuthModeWeCom, model.AuthModeSSO:
 		// Neither needs a username or a stored password: WeCom shows a QR
 		// code, single sign-on runs on the portal's own page.
@@ -1914,6 +1986,7 @@ func (a *app) saveEditor() {
 			d.err = "请填写密码"
 			return
 		}
+		}
 	}
 	if !d.inPool && socksPort == 0 {
 		d.err = "至少勾选统一入口，或填一个独立 SOCKS5 端口"
@@ -1923,15 +1996,26 @@ func (a *app) saveEditor() {
 	// username: drop it so the card does not show an account that is never
 	// sent.
 	username := strings.TrimSpace(d.username)
-	if model.AuthMode(mode) != model.AuthModePassword && model.AuthMode(mode) != model.AuthModeAuto {
+	if kind == model.KindATrust &&
+		model.AuthMode(mode) != model.AuthModePassword && model.AuthMode(mode) != model.AuthModeAuto {
 		username = ""
+	}
+	covers := []string(nil)
+	if kind != model.KindATrust {
+		covers = splitCovers(d.covers)
+		if len(covers) == 0 {
+			d.err = "请至少填一条应用边界（网段或域名）"
+			return
+		}
 	}
 	p := model.AccessPoint{
 		ID:          d.editingID,
+		Kind:        kind,
 		Name:        strings.TrimSpace(d.name),
 		Server:      server,
 		Port:        port,
 		Username:    username,
+		Covers:      covers,
 		AuthMode:    mode,
 		LoginDomain: strings.TrimSpace(d.domain),
 		SocksPort:   socksPort,
@@ -1939,6 +2023,10 @@ func (a *app) saveEditor() {
 		AutoConnect: d.autoConnect,
 	}
 	monitor := d.monitor
+	if kind != model.KindATrust {
+		// Session validity is an aTrust portal concept.
+		monitor = false
+	}
 	p.Monitor = &monitor
 	if every, err := strconv.Atoi(strings.TrimSpace(d.monitorEvery)); err == nil && every > 0 {
 		p.MonitorInterval = every

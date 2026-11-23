@@ -167,7 +167,7 @@ type Manager struct {
 	points     map[string]*endpoint
 	settings   model.Settings
 
-	connector Connector
+	backends  map[string]Backend
 	creds     CredentialFunc
 	bus       *LogBus
 	notify    func()
@@ -236,13 +236,20 @@ type endpoint struct {
 	retryStep int
 }
 
-// NewManager returns a manager that uses connector to log in and creds to
-// read secrets. notify runs after every state change, and may be nil.
-func NewManager(connector Connector, creds CredentialFunc, bus *LogBus, notify func()) *Manager {
+// NewManager returns a manager that logs in through the given backends and
+// reads secrets with creds. notify runs after every state change, and may be
+// nil.
+func NewManager(backends []Backend, creds CredentialFunc, bus *LogBus, notify func()) *Manager {
+	byKind := make(map[string]Backend, len(backends))
+	for _, b := range backends {
+		if b != nil {
+			byKind[b.Kind()] = b
+		}
+	}
 	m := &Manager{
 		points:      map[string]*endpoint{},
 		settings:    model.DefaultSettings(),
-		connector:   connector,
+		backends:    byKind,
 		creds:       creds,
 		bus:         bus,
 		notify:      notify,
@@ -536,26 +543,35 @@ func (m *Manager) connect(id string, gen int) {
 			return
 		}
 	}
-	switch model.AuthMode(cfg.AuthMode) {
-	case model.AuthModeWeCom:
-		if creds.ExternalLogin == nil {
-			m.fail(id, gen, "扫码登录窗口不可用")
-			return
-		}
-	case model.AuthModeSSO:
-		// Single sign-on keeps no password here: the browser login saved
-		// the session, and the connector resumes it. When that session is
-		// gone the connector says so, which is more useful than a
-		// credential error.
-	case model.AuthModeAuto:
-		if strings.TrimSpace(creds.Login) == "" && creds.ExternalLogin == nil {
-			m.fail(id, gen, "自动识别需要密码或扫码登录窗口")
-			return
-		}
-	default:
-		if strings.TrimSpace(creds.Login) == "" {
-			m.fail(id, gen, "没有保存密码：先编辑接入点填上密码")
-			return
+	backend, ok := m.backendFor(cfg.KindOrDefault())
+	if !ok {
+		m.fail(id, gen, fmt.Sprintf("不支持的接入点类型：%s", cfg.KindOrDefault()))
+		return
+	}
+	// The aTrust backend has its own credential preconditions; other kinds
+	// validate inside their backend.
+	if cfg.KindOrDefault() == model.KindATrust {
+		switch model.AuthMode(cfg.AuthMode) {
+		case model.AuthModeWeCom:
+			if creds.ExternalLogin == nil {
+				m.fail(id, gen, "扫码登录窗口不可用")
+				return
+			}
+		case model.AuthModeSSO:
+			// Single sign-on keeps no password here: the browser login saved
+			// the session, and the connector resumes it. When that session is
+			// gone the connector says so, which is more useful than a
+			// credential error.
+		case model.AuthModeAuto:
+			if strings.TrimSpace(creds.Login) == "" && creds.ExternalLogin == nil {
+				m.fail(id, gen, "自动识别需要密码或扫码登录窗口")
+				return
+			}
+		default:
+			if strings.TrimSpace(creds.Login) == "" {
+				m.fail(id, gen, "没有保存密码：先编辑接入点填上密码")
+				return
+			}
 		}
 	}
 
@@ -571,7 +587,7 @@ func (m *Manager) connect(id string, gen int) {
 	defer cancel()
 
 	start := time.Now()
-	sess, err := m.callConnector(ctx, cfg, creds)
+	sess, err := m.callBackend(ctx, backend, cfg, creds)
 	if err != nil {
 		m.fail(id, gen, friendlyConnectError(err))
 		return
@@ -688,13 +704,23 @@ func (m *Manager) reconnectAfter(id string, delay time.Duration) {
 	}()
 }
 
-func (m *Manager) callConnector(ctx context.Context, cfg model.AccessPoint, creds Credentials) (sess Session, err error) {
+// backendFor returns the backend registered for kind, treating an empty kind
+// as aTrust.
+func (m *Manager) backendFor(kind string) (Backend, bool) {
+	if strings.TrimSpace(kind) == "" {
+		kind = model.KindATrust
+	}
+	b, ok := m.backends[kind]
+	return b, ok
+}
+
+func (m *Manager) callBackend(ctx context.Context, backend Backend, cfg model.AccessPoint, creds Credentials) (sess Session, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("登录过程崩溃：%v", r)
 		}
 	}()
-	return m.connector(ctx, cfg, creds)
+	return backend.Connect(ctx, cfg, creds)
 }
 
 func (m *Manager) fail(id string, gen int, msg string) {
@@ -1220,6 +1246,10 @@ func (m *Manager) checkSessions() {
 			if !ep.cfg.MonitorEnabled() {
 				continue
 			}
+			if !ep.cfg.IsATrust() {
+				// Session validity is an aTrust portal concept.
+				continue
+			}
 			// 单点登录的会话由浏览器产生，服务器的在线检查会把它当作
 			// 「另一个客户端接管」而作废，隧道随即变成 invalid SID。
 			// 这类接入点不做会话探测。
@@ -1668,6 +1698,11 @@ func (m *Manager) probeAll(autoReconnect bool) {
 		// A tunnel that just carried traffic is demonstrably alive; probing it
 		// only adds load and noise. A tunnel that already failed is retried
 		// quickly, so a dead one is noticed in seconds rather than minutes.
+		if !ep.cfg.IsATrust() {
+			// Non-aTrust points have no aTrust app to probe; their session
+			// has no portal-side health API either.
+			continue
+		}
 		if ep.tunnelFails > 0 {
 			if time.Since(ep.lastProbe) < 10*time.Second {
 				continue

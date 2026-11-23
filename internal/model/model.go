@@ -118,14 +118,30 @@ func (m AuthMode) Valid() bool {
 	return m == AuthModeAuto || m == AuthModePassword || m == AuthModeWeCom || m == AuthModeSSO
 }
 
-// AccessPoint is one aTrust server the app logs in to. Its cred and
-// TOTP secret live in the secret store, under the point's ID, not here.
+// AccessPoint kinds. Empty means aTrust for backward compatibility.
+const (
+	KindATrust    = "atrust"
+	KindSoftEther = "softether"
+	// KindSocks5 is an external SOCKS5 proxy used as an interim transport
+	// until the native SoftEther backend lands.
+	KindSocks5 = "socks5"
+)
+
+// AccessPoint is one access point the app logs in to. Its cred and TOTP
+// secret live in the secret store, under the point's ID, not here.
 type AccessPoint struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Server   string `json:"server"`
-	Port     int    `json:"port"`
+	ID     string `json:"id"`
+	Kind   string `json:"kind,omitempty"`
+	Name   string `json:"name"`
+	Server string `json:"server"`
+	Port   int    `json:"port"`
+	// Hub is the SoftEther virtual HUB name; unused by aTrust.
+	Hub      string `json:"hub,omitempty"`
 	Username string `json:"username"`
+	// Covers is the user-defined application boundary of a non-aTrust point:
+	// CIDRs, IP ranges and exact domains. aTrust points get theirs from the
+	// server instead.
+	Covers []string `json:"covers,omitempty"`
 	// AuthMode is "psw", "wecom" or "sso"; empty means "psw". The old
 	// "auto" value is still accepted but no longer offered.
 	AuthMode    string `json:"authMode,omitempty"`
@@ -152,6 +168,23 @@ type AccessPoint struct {
 	// access point.
 	DisabledApps []string `json:"disabledApps,omitempty"`
 }
+
+// KindOrDefault reports the backend kind, reading an empty kind as aTrust.
+func (p *AccessPoint) KindOrDefault() string {
+	if p.Kind == "" {
+		return KindATrust
+	}
+	return p.Kind
+}
+
+// IsSoftEther reports whether this point uses the native SoftEther backend.
+func (p *AccessPoint) IsSoftEther() bool { return p.Kind == KindSoftEther }
+
+// IsSocks5 reports whether this point is an external SOCKS5 transport.
+func (p *AccessPoint) IsSocks5() bool { return p.Kind == KindSocks5 }
+
+// IsATrust reports whether this point uses the aTrust backend (the default).
+func (p *AccessPoint) IsATrust() bool { return p.KindOrDefault() == KindATrust }
 
 // defaultMonitorInterval is how often the session is probed when unset.
 const defaultMonitorInterval = 300
@@ -328,20 +361,34 @@ func (s *Settings) Normalize() {
 // Normalize cleans one access point.
 func (p *AccessPoint) Normalize() {
 	p.Server = CleanServer(p.Server)
+	p.Kind = p.KindOrDefault()
+	p.Hub = strings.TrimSpace(p.Hub)
 	p.Username = strings.TrimSpace(p.Username)
-	if p.AuthMode == "" || !AuthMode(p.AuthMode).Valid() {
+	if !p.IsATrust() {
+		p.Covers = NormalizeCovers(p.Covers)
+	}
+	if p.IsATrust() && (p.AuthMode == "" || !AuthMode(p.AuthMode).Valid()) {
 		// Empty has always meant "账号密码"; keep that reading now that
 		// "自动识别" is gone from the editor.
 		p.AuthMode = string(AuthModePassword)
 	}
 	p.LoginDomain = strings.TrimSpace(p.LoginDomain)
-	if p.LoginDomain == "" {
+	if p.IsATrust() && p.LoginDomain == "" {
 		// ZJU-Connect's aTrust default; servers list it as an auth
 		// domain and the login fails without one.
 		p.LoginDomain = "Radius"
 	}
+	if !p.IsATrust() {
+		// Only aTrust has an auth mode and a login domain.
+		p.AuthMode = ""
+		p.LoginDomain = ""
+	}
 	if p.Port == 0 {
-		p.Port = 443
+		if p.IsSocks5() {
+			p.Port = 1080
+		} else {
+			p.Port = 443
+		}
 	}
 	if p.Name == "" {
 		p.Name = p.Server
@@ -355,6 +402,26 @@ func (p *AccessPoint) Normalize() {
 	if p.CreatedAt == 0 {
 		p.CreatedAt = time.Now().Unix()
 	}
+}
+
+// NormalizeCovers trims the application boundary, drops empty entries and
+// removes case-insensitive duplicates.
+func NormalizeCovers(covers []string) []string {
+	seen := make(map[string]bool, len(covers))
+	out := make([]string, 0, len(covers))
+	for _, cover := range covers {
+		cover = strings.TrimSpace(cover)
+		if cover == "" {
+			continue
+		}
+		key := strings.ToLower(cover)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, cover)
+	}
+	return out
 }
 
 // ParseAccessAddress turns what the aTrust client calls an access address,
@@ -465,18 +532,31 @@ func (p *AccessPoint) Validate() error {
 	if p.Port < 1 || p.Port > 65535 {
 		return errors.New("端口必须在 1–65535 之间")
 	}
-	switch AuthMode(p.AuthMode) {
-	case AuthModeAuto:
-		// Legacy: the server decides; a stored password makes auth/psw the
-		// first choice, otherwise an external login is used.
-	case AuthModeWeCom:
-		// The QR login has no username; the server tells us who it is.
-	case AuthModeSSO:
-		// Single sign-on happens on the portal's own page, so the client
-		// needs neither a username nor a password.
-	default:
+	if p.IsSoftEther() {
+		if p.Hub == "" {
+			return errors.New("SoftEther 接入点缺少虚拟 HUB 名")
+		}
 		if p.Username == "" {
-			return errors.New("用户名不能为空")
+			return errors.New("SoftEther 接入点缺少用户名")
+		}
+	} else if p.IsSocks5() {
+		if len(p.Covers) == 0 {
+			return errors.New("请至少填一条应用边界（网段或域名）")
+		}
+	} else {
+		switch AuthMode(p.AuthMode) {
+		case AuthModeAuto:
+			// Legacy: the server decides; a stored password makes auth/psw the
+			// first choice, otherwise an external login is used.
+		case AuthModeWeCom:
+			// The QR login has no username; the server tells us who it is.
+		case AuthModeSSO:
+			// Single sign-on happens on the portal's own page, so the client
+			// needs neither a username nor a password.
+		default:
+			if p.Username == "" {
+				return errors.New("用户名不能为空")
+			}
 		}
 	}
 	if p.SocksPort < 0 || p.SocksPort > 65535 {
