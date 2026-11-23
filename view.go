@@ -1237,19 +1237,25 @@ func authModeLabels() []string {
 
 // pointKindLabels name the backend kinds offered by the editor.
 func pointKindLabels() []string {
-	return []string{"aTrust 零信任", "外部 SOCKS5（过渡）"}
+	return []string{"aTrust 零信任", "SoftEther VPN", "外部 SOCKS5（过渡）"}
 }
 
 func pointKindFromLabel(label string) string {
-	if label == pointKindLabels()[1] {
+	switch label {
+	case pointKindLabels()[1]:
+		return model.KindSoftEther
+	case pointKindLabels()[2]:
 		return model.KindSocks5
 	}
 	return model.KindATrust
 }
 
 func pointKindLabel(kind string) string {
-	if kind == model.KindSocks5 {
+	switch kind {
+	case model.KindSoftEther:
 		return pointKindLabels()[1]
+	case model.KindSocks5:
+		return pointKindLabels()[2]
 	}
 	return pointKindLabels()[0]
 }
@@ -1333,7 +1339,35 @@ func (a *app) editorView(c *ui.Context) {
 			ui.Field(c, "类型", func() {
 				ui.Select(c, &d.kindLabel, pointKindLabels()).Width(220)
 			})
-			if pointKindFromLabel(d.kindLabel) == model.KindSocks5 {
+			if pointKindFromLabel(d.kindLabel) == model.KindSoftEther {
+				ui.Field(c, "服务器地址", func() {
+					ui.TextInput(c, &d.address).
+						Placeholder("例如：vpn.example.com:5555").Grow(1)
+				})
+				ui.Row(c).Gap(10).AlignItems(ui.End).Children(func() {
+					ui.Field(c, "虚拟 HUB", func() {
+						ui.TextInput(c, &d.hub).Placeholder("HUB 名").Width(180)
+					})
+					ui.Field(c, "用户名", func() {
+						ui.TextInput(c, &d.username).Placeholder("账号").Width(180)
+					})
+				})
+				ui.Field(c, "密码", func() {
+					in := ui.TextInput(c, &d.cred).Password().Grow(1)
+					if d.hasPassword {
+						in.Placeholder("已保存，留空则沿用")
+					} else {
+						in.Placeholder("登录密码")
+					}
+				})
+				ui.Field(c, "应用边界（可选）", func() {
+					ui.TextInput(c, &d.covers).
+						Placeholder("留空则使用服务端下发的路由；也可填 172.16.0.0/12, app.example.com")
+				})
+				ui.Text(c, "SoftEther 在进程内建栈，不创建任何系统网卡，"+
+					"因此可以和其它 TUN 客户端同时使用。").
+					FontSize(11).TextColor(t.TextMuted)
+			} else if pointKindFromLabel(d.kindLabel) == model.KindSocks5 {
 				ui.Field(c, "代理地址", func() {
 					ui.TextInput(c, &d.address).
 						Placeholder("例如：127.0.0.1:7899").Grow(1)
@@ -1421,9 +1455,11 @@ func (a *app) editorView(c *ui.Context) {
 				}
 			}
 			}
-			ui.Field(c, "密码存储方式", func() {
-				ui.Select(c, &d.secretStore, secretStoreLabels()).Width(220)
-			})
+			if pointKindFromLabel(d.kindLabel) != model.KindSocks5 {
+				ui.Field(c, "密码存储方式", func() {
+					ui.Select(c, &d.secretStore, secretStoreLabels()).Width(220)
+				})
+			}
 			ui.Divider(c)
 			ui.Row(c).Gap(14).AlignItems(ui.Start).Children(func() {
 				ui.Field(c, "独立 SOCKS5 端口", func() {
@@ -1923,6 +1959,7 @@ func (a *app) openEditor(v vpn.View) {
 		authMode:      string(mode),
 		authModeLabel: mode.Label(),
 		domain:        p.LoginDomain,
+		hub:           p.Hub,
 		covers:        strings.Join(p.Covers, ", "),
 		socksPort:     strconv.Itoa(p.SocksPort),
 		inPool:        p.InPool,
@@ -1967,6 +2004,20 @@ func (a *app) saveEditor() {
 	if mode == "" {
 		mode = d.authMode
 	}
+	if kind == model.KindSoftEther {
+		if strings.TrimSpace(d.hub) == "" {
+			d.err = "请填写虚拟 HUB 名"
+			return
+		}
+		if strings.TrimSpace(d.username) == "" {
+			d.err = "请填写用户名"
+			return
+		}
+		if strings.TrimSpace(d.cred) == "" && !d.hasPassword {
+			d.err = "请填写密码"
+			return
+		}
+	}
 	if kind == model.KindATrust {
 		switch model.AuthMode(mode) {
 	case model.AuthModeWeCom, model.AuthModeSSO:
@@ -2003,7 +2054,7 @@ func (a *app) saveEditor() {
 	covers := []string(nil)
 	if kind != model.KindATrust {
 		covers = splitCovers(d.covers)
-		if len(covers) == 0 {
+		if kind == model.KindSocks5 && len(covers) == 0 {
 			d.err = "请至少填一条应用边界（网段或域名）"
 			return
 		}
@@ -2015,6 +2066,7 @@ func (a *app) saveEditor() {
 		Server:      server,
 		Port:        port,
 		Username:    username,
+		Hub:         strings.TrimSpace(d.hub),
 		Covers:      covers,
 		AuthMode:    mode,
 		LoginDomain: strings.TrimSpace(d.domain),

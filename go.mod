@@ -9,6 +9,7 @@ require (
 	github.com/mythologyli/zju-connect v1.3.1
 	github.com/refraction-networking/utls v1.8.2
 	golang.org/x/net v0.59.0
+	gvisor.dev/gvisor v0.0.0-20260129214308-cb856800aa1c
 )
 
 require (
@@ -47,7 +48,6 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.51.0 // indirect
-	gvisor.dev/gvisor v0.0.0-20260129214308-cb856800aa1c // indirect
 	inet.af/netaddr v0.0.0-20230525184311-b8eac61e914a // indirect
 )
 

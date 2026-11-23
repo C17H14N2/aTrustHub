@@ -22,6 +22,7 @@ import (
 	"github.com/egoist/mygo/ui"
 
 	"github.com/qy/easyconnect/internal/model"
+	"github.com/qy/easyconnect/internal/softether"
 	"github.com/qy/easyconnect/internal/store"
 	"github.com/qy/easyconnect/internal/vpn"
 )
@@ -164,6 +165,7 @@ type editorDraft struct {
 	cred          string
 	totp          string
 	domain        string
+	hub           string
 	covers        string
 	socksPort     string
 	inPool        bool
@@ -320,6 +322,7 @@ func newApp() (*app, error) {
 				Debug:   os.Getenv("EASYCONNECT_DEBUG") != "",
 			})),
 			vpn.NewSocks5Backend(),
+			softether.NewBackend(),
 		},
 		a.credentials,
 		a.bus,
