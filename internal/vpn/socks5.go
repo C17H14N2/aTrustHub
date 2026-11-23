@@ -56,22 +56,22 @@ func newSocks5Session(cfg model.AccessPoint, creds Credentials) (*socks5Session,
 // coversApps turns the user-defined boundary into one app, so the aggregate's
 // candidateCovers (exact domain, CIDR and IP range) works unchanged.
 func coversApps(covers []string) []App {
-	app := App{Name: "自定义应用边界"}
+	apps := make([]App, 0, len(covers))
 	for _, cover := range covers {
 		cover = strings.TrimSpace(cover)
 		if cover == "" {
 			continue
 		}
-		app.Addresses = append(app.Addresses, AppAddress{
-			Protocol: "all",
-			Host:     cover,
-			Port:     "1-65535",
+		apps = append(apps, App{
+			Name: cover,
+			Addresses: []AppAddress{{
+				Protocol: "all",
+				Host:     cover,
+				Port:     "1-65535",
+			}},
 		})
 	}
-	if len(app.Addresses) == 0 {
-		return nil
-	}
-	return []App{app}
+	return apps
 }
 
 func (s *socks5Session) Dial(ctx context.Context, network, addr string) (net.Conn, error) {

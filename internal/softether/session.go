@@ -161,22 +161,22 @@ func (s *Session) fail(err error) {
 // appsFromCovers turns the user-defined boundary into the app list the
 // aggregate router matches on.
 func appsFromCovers(covers []string) []vpn.App {
-	app := vpn.App{Name: "自定义应用边界"}
+	apps := make([]vpn.App, 0, len(covers))
 	for _, cover := range covers {
 		cover = strings.TrimSpace(cover)
 		if cover == "" {
 			continue
 		}
-		app.Addresses = append(app.Addresses, vpn.AppAddress{
-			Protocol: "all",
-			Host:     cover,
-			Port:     "1-65535",
+		apps = append(apps, vpn.App{
+			Name: cover,
+			Addresses: []vpn.AppAddress{{
+				Protocol: "all",
+				Host:     cover,
+				Port:     "1-65535",
+			}},
 		})
 	}
-	if len(app.Addresses) == 0 {
-		return nil
-	}
-	return []vpn.App{app}
+	return apps
 }
 
 // routeFromCover turns a CIDR/range cover into a stack route.

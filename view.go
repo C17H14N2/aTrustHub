@@ -856,6 +856,13 @@ func (a *app) pointCard(c *ui.Context, v vpn.View) {
 		})
 
 		ui.Row(c).Gap(16).Children(func() {
+			if v.Kind == model.KindSoftEther {
+				label := "进程内 L2"
+				if len(v.NodeGroups) > 0 {
+					label = fmt.Sprintf("进程内 L2 · %d 条边界", len(v.NodeGroups))
+				}
+				meta(c, t, "隧道模式", label)
+			}
 			if v.ClientIP != "" {
 				meta(c, t, "隧道 IP", v.ClientIP)
 			}
@@ -1196,6 +1203,28 @@ func addrOf(v vpn.View) string {
 
 func subtitleOf(v vpn.View) string {
 	parts := []string{}
+	switch v.Kind {
+	case model.KindSoftEther:
+		// The backend is worth showing: it explains why this point has no
+		// aTrust auth mode and where its boundary comes from.
+		parts = append(parts, "SoftEther 隧道（进程内）")
+		if v.Hub != "" {
+			parts = append(parts, "HUB "+v.Hub)
+		}
+		if v.Username != "" {
+			parts = append(parts, v.Username)
+		}
+		if v.SocksPort > 0 {
+			parts = append(parts, "SOCKS5 :"+strconv.Itoa(v.SocksPort))
+		}
+		return strings.Join(parts, " · ")
+	case model.KindSocks5:
+		parts = append(parts, "外部 SOCKS5（过渡）")
+		if v.SocksPort > 0 {
+			parts = append(parts, "SOCKS5 :"+strconv.Itoa(v.SocksPort))
+		}
+		return strings.Join(parts, " · ")
+	}
 	switch model.AuthMode(v.AuthMode) {
 	case model.AuthModeAuto:
 		parts = append(parts, "自动识别（旧）")
@@ -1266,6 +1295,33 @@ func editorAddress(p *model.AccessPoint) string {
 		return net.JoinHostPort(p.Server, strconv.Itoa(p.Port))
 	}
 	return model.FormatAccessAddress(p.Server, p.Port)
+}
+
+
+// renderCovers draws an editable boundary list: one target per row, with its
+// own delete button and a button to append a new one.
+func renderCovers(c *ui.Context, d *editorDraft, label, hint string) {
+	t := c.Theme()
+	ui.Field(c, label, func() {
+		ui.Column(c).Gap(6).Children(func() {
+			for i := range d.covers {
+				idx := i
+				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+					ui.TextInput(c, &d.covers[idx]).
+						Placeholder("172.33.64.0/24 或 app.example.com").Grow(1)
+					if ui.Button(c, "删除").FontSize(11).Clicked() {
+						d.covers = append(d.covers[:idx], d.covers[idx+1:]...)
+					}
+				})
+			}
+			if ui.Button(c, "＋ 添加一条边界").FontSize(12).Clicked() {
+				d.covers = append(d.covers, "")
+			}
+		})
+	})
+	if hint != "" {
+		ui.Text(c, hint).FontSize(11).TextColor(t.TextMuted)
+	}
 }
 
 // splitCovers accepts commas, semicolons and whitespace between entries.
@@ -1360,10 +1416,8 @@ func (a *app) editorView(c *ui.Context) {
 						in.Placeholder("登录密码")
 					}
 				})
-				ui.Field(c, "应用边界（可选）", func() {
-					ui.TextInput(c, &d.covers).
-						Placeholder("留空则使用服务端下发的路由；也可填 172.16.0.0/12, app.example.com")
-				})
+				renderCovers(c, d, "应用边界（可选）",
+					"留空则使用服务端下发的路由；也可以逐条添加要主动放行的网段或域名")
 				ui.Text(c, "SoftEther 在进程内建栈，不创建任何系统网卡，"+
 					"因此可以和其它 TUN 客户端同时使用。").
 					FontSize(11).TextColor(t.TextMuted)
@@ -1385,11 +1439,9 @@ func (a *app) editorView(c *ui.Context) {
 						}
 					})
 				})
-				ui.Field(c, "应用边界", func() {
-					ui.TextInput(c, &d.covers).
-						Placeholder("逗号分隔，如 172.33.64.0/24, 172.32.0.16/32, app.example.com")
-				})
-				ui.Text(c, "只有命中这份边界的流量才会交给这个接入点，支持 CIDR、IP 区间和完整域名。").
+				renderCovers(c, d, "应用边界",
+					"只有命中这份边界的流量才会交给这个接入点，支持 CIDR、IP 区间和完整域名")
+				ui.Text(c, "至少填一条。").
 					FontSize(11).TextColor(t.TextMuted)
 			} else {
 				// 接入地址先填，检测按钮紧跟着它，点检测时地址已经在上方。
@@ -1931,6 +1983,7 @@ func (a *app) openNewEditor() {
 		monitor:       true,
 		monitorEvery:  "300",
 		secretStore:   secretStoreLabel(a.cfg.Settings.SecretStore),
+		covers:        []string{""},
 	}
 }
 
@@ -1960,7 +2013,7 @@ func (a *app) openEditor(v vpn.View) {
 		authModeLabel: mode.Label(),
 		domain:        p.LoginDomain,
 		hub:           p.Hub,
-		covers:        strings.Join(p.Covers, ", "),
+		covers:        append([]string(nil), p.Covers...),
 		socksPort:     strconv.Itoa(p.SocksPort),
 		inPool:        p.InPool,
 		autoConnect:   p.AutoConnect,
@@ -1969,6 +2022,9 @@ func (a *app) openEditor(v vpn.View) {
 		secretStore:   secretStoreLabel(a.cfg.Settings.SecretStore),
 		hasPassword:   a.hasPassword(p.ID),
 		detected:      nil,
+	}
+	if len(a.editor.covers) == 0 {
+		a.editor.covers = []string{""}
 	}
 	a.editor.hasTOTP = a.hasTOTP(p.ID)
 	// A point saved before the mode was a choice gets the mode the server
@@ -2053,7 +2109,7 @@ func (a *app) saveEditor() {
 	}
 	covers := []string(nil)
 	if kind != model.KindATrust {
-		covers = splitCovers(d.covers)
+		covers = model.NormalizeCovers(d.covers)
 		if kind == model.KindSocks5 && len(covers) == 0 {
 			d.err = "请至少填一条应用边界（网段或域名）"
 			return

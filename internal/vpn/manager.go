@@ -106,10 +106,13 @@ type CredentialFunc func(id string) (Credentials, error)
 
 // View is a copy of one access point's state for the UI.
 type View struct {
-	ID          string
-	Name        string
-	Server      string
-	Port        int
+	ID     string
+	Kind   string
+	Name   string
+	Server string
+	Port   int
+	// Hub is the SoftEther virtual HUB; empty for other kinds.
+	Hub         string
 	Username    string
 	AuthMode    string
 	LoginDomain string
@@ -445,7 +448,8 @@ func (m *Manager) Views() []View {
 			continue
 		}
 		v := View{
-			ID: ep.cfg.ID, Name: ep.cfg.Name, Server: ep.cfg.Server,
+			ID: ep.cfg.ID, Kind: ep.cfg.KindOrDefault(),
+			Name: ep.cfg.Name, Server: ep.cfg.Server, Hub: ep.cfg.Hub,
 			Port: ep.cfg.Port, Username: ep.cfg.Username,
 			AuthMode: ep.cfg.AuthMode, LoginDomain: ep.cfg.LoginDomain,
 			SocksPort: ep.cfg.SocksPort,
