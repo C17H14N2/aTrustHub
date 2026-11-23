@@ -70,6 +70,26 @@ func Connect(ctx context.Context, point model.AccessPoint, creds vpn.Credentials
 		done:   make(chan struct{}),
 	}
 
+	// The TAP-based reference client stays alive on background Ethernet
+	// traffic the kernel generates (IPv6 neighbour discovery, ARP, DHCP
+	// renewals). This stack is silent, so one unicast ICMP echo is sent every
+	// few seconds to take its place: a real frame the hub counts as session
+	// traffic, without spending its broadcast budget.
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		var seq uint16
+		for {
+			select {
+			case <-s.done:
+				return
+			case <-t.C:
+				seq++
+				_ = l2.PingGatewayICMP(seq)
+			}
+		}
+	}()
+
 	// Pump frames into the stack.
 	go func() {
 		for {
@@ -243,9 +263,14 @@ func (s *Session) fail(err error) {
 	})
 }
 
-// probeAddress picks a target for the session keep-alive: the first host of
-// the first published network, on a port nothing listens on.
+// probeAddress picks the target for the session keep-alive. It must be a host
+// that answers: the point of the probe is the reply frame, because the hub and
+// this client both measure liveness by received data. The gateway answers with
+// RST on a closed port, so it is the reliable choice.
 func probeAddress(lease Lease) string {
+	if lease.GW != nil {
+		return fmt.Sprintf("%s:1", lease.GW)
+	}
 	for _, r := range lease.Routes {
 		if r.Dest == nil {
 			continue

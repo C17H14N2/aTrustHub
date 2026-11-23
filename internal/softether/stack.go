@@ -54,7 +54,8 @@ type L2Stack struct {
 
 	mu   sync.Mutex
 	ip   tcpip.Address
-	gw   net.IP
+	gw    net.IP
+	gwMAC tcpip.LinkAddress
 	routes []Route
 }
 
@@ -116,6 +117,9 @@ func (s *L2Stack) Configure(lease Lease) error {
 	if gw != nil {
 		if mac, ok := s.arpResolve(addr, gw, 5*time.Second); ok {
 			s.ns.AddStaticNeighbor(nicID, ipv4.ProtocolNumber, tcpip.AddrFromSlice(gw.To4()), mac)
+			s.mu.Lock()
+			s.gwMAC = mac
+			s.mu.Unlock()
 		}
 	}
 
@@ -261,6 +265,50 @@ func (e *l2Endpoint) deliver(frame []byte) {
 	})
 	defer pkt.DecRef()
 	e.eth.DeliverNetworkPacket(0, pkt)
+}
+
+
+// PingGatewayICMP sends an ICMP echo request to the gateway. Unlike ARP this is
+// a unicast frame, so it does not spend the hub's broadcast budget, and unlike
+// the TLS keep-alive it is a real Ethernet frame that the hub counts as session
+// traffic.
+func (s *L2Stack) PingGatewayICMP(seq uint16) error {
+	s.mu.Lock()
+	srcIP, gwIP := s.ip, s.gw
+	gwMAC := s.gwMAC
+	s.mu.Unlock()
+	if gwIP == nil || srcIP == (tcpip.Address{}) || len(gwMAC) == 0 {
+		return nil
+	}
+
+	src4 := srcIP.As4()
+	icmp := make([]byte, 8+16) // header + payload
+	icmp[0] = 8                // echo request
+	icmp[1] = 0
+	binary.BigEndian.PutUint16(icmp[4:], 0x1234)
+	binary.BigEndian.PutUint16(icmp[6:], seq)
+	for i := 8; i < len(icmp); i++ {
+		icmp[i] = byte(i)
+	}
+	binary.BigEndian.PutUint16(icmp[2:], ipChecksum(icmp))
+
+	ip := make([]byte, 20)
+	ip[0] = 0x45
+	binary.BigEndian.PutUint16(ip[2:], uint16(20+len(icmp)))
+	binary.BigEndian.PutUint16(ip[4:], seq)
+	ip[8] = 64
+	ip[9] = 1 // ICMP
+	copy(ip[12:16], src4[:])
+	copy(ip[16:20], gwIP.To4())
+	binary.BigEndian.PutUint16(ip[10:], ipChecksum(ip))
+
+	eth := make([]byte, 14)
+	copy(eth[0:6], gwMAC)
+	copy(eth[6:12], src4[:])
+	eth[12], eth[13] = 0x08, 0x00
+
+	frame := append(append(append(eth, ip...), icmp...), make([]byte, 6)...) // pad to 60
+	return s.l2.write(frame)
 }
 
 // PingGateway sends one ARP request for the gateway. A real frame keeps the

@@ -45,6 +45,11 @@ type Client struct {
 	readEr chan error
 	cfg    Config
 
+	// idleTimeout is the server's policy TimeOut: with no inbound data for
+	// that long the official client drops the connection and reconnects,
+	// because the hub stops serving new flows on a quiet session.
+	idleTimeout time.Duration
+
 	writeMu sync.Mutex
 	closed  bool
 	done    chan struct{}
@@ -182,8 +187,12 @@ func connectSync(cfg Config) (*Client, error) {
 		fmt.Println("数据连接未建立，回退单连接：", derr)
 	}
 
+	idle := time.Duration(policy.TimeOut) * time.Second
+	if idle <= 0 {
+		idle = 20 * time.Second
+	}
 	c := &Client{
-		ctrl: sock, data: dataSock, cfg: cfg,
+		ctrl: sock, data: dataSock, cfg: cfg, idleTimeout: idle,
 		frames: make(chan []byte, 64),
 		readEr: make(chan error, 4),
 		done:   make(chan struct{}),
@@ -366,6 +375,12 @@ func (c *Client) startReaders() {
 }
 
 // ReadFrame returns the next Ethernet frame from any connection.
+//
+// Note: the official client never drops a quiet session either - its log shows
+// sessions lasting hours. It stays alive because its TAP device keeps receiving
+// background frames (ARP requests, IPv6 neighbour discovery) that a user-space
+// stack with no IPv6 and no neighbours does not get. Do not add an idle timeout
+// here; it would rebuild every 20 seconds.
 func (c *Client) ReadFrame() ([]byte, error) {
 	select {
 	case frame := <-c.frames:
