@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/qy/easyconnect/internal/softether/cedar"
@@ -48,6 +49,9 @@ type Client struct {
 	closed  bool
 	done    chan struct{}
 	once    sync.Once
+
+	// Frames received from the hub, by Ethernet type, for diagnostics.
+	framesIn atomic.Int64
 }
 
 // dialHub authenticates against the hub and switches the stream to tunneling
@@ -142,8 +146,11 @@ func connectSync(cfg Config) (*Client, error) {
 	}
 
 	sessionName, connectionName, policy := cedar.ParseWelcomeFromPack(welcome)
-	fmt.Printf("SoftEther 策略：TimeOut=%ds MaxConnection=%d MaxMac=%d MaxIP=%d MultiLogins=%d NoQoS=%v ArpDhcpOnly=%v\n",
-		policy.TimeOut, policy.MaxConnection, policy.MaxMac, policy.MaxIP, policy.MultiLogins, policy.NoQoS, policy.ArpDhcpOnly)
+	fmt.Printf("SoftEther 策略：TimeOut=%ds MaxConnection=%d MaxMac=%d MaxIP=%d MultiLogins=%d\n",
+		policy.TimeOut, policy.MaxConnection, policy.MaxMac, policy.MaxIP, policy.MultiLogins)
+	fmt.Printf("SoftEther 策略：AutoDisconnect=%ds PrivacyFilter=%v NoServer=%v NoBridge=%v NoRouting=%v CheckMac=%v CheckIP=%v FilterIPv4=%v VLanId=%d\n",
+		policy.AutoDisconnect, policy.PrivacyFilter, policy.NoServer, policy.NoBridge, policy.NoRouting,
+		policy.CheckMac, policy.CheckIP, policy.FilterIPv4, policy.VLanId)
 	key, key32, err := cedar.GetSessionKeyFromPack(welcome)
 	if err != nil {
 		sock.Close()
@@ -165,9 +172,15 @@ func connectSync(cfg Config) (*Client, error) {
 	// A second connection can be bound with additional_connect, but this hub
 	// answers it with EOF, so the data path shares the control connection.
 	/// Until that handshake is understood, one connection carries both.
-	// One connection, as the official client uses. additional_connect is only
-	// meaningful when max_connection > 1.
+	// The official client keeps a second connection bound with
+	// additional_connect; measured against this hub it is what keeps inbound
+	// frames flowing, so it is opened unconditionally.
 	dataSock := sock
+	if second, derr := openDataChannel(&conn, cfg); derr == nil {
+		dataSock = second
+	} else {
+		fmt.Println("数据连接未建立，回退单连接：", derr)
+	}
 
 	c := &Client{
 		ctrl: sock, data: dataSock, cfg: cfg,
@@ -341,6 +354,7 @@ func (c *Client) startReaders() {
 					}
 					return
 				}
+				c.framesIn.Add(1)
 				select {
 				case c.frames <- frame:
 				case <-c.done:
@@ -396,6 +410,9 @@ func readFrame(conn *mayaqua.Sock) ([]byte, error) {
 		return frame, nil
 	}
 }
+
+// FramesIn reports how many frames the hub has sent on this tunnel.
+func (c *Client) FramesIn() int64 { return c.framesIn.Load() }
 
 // SetReadDeadline bounds ReadFrame, for shutdown.
 func (c *Client) SetReadDeadline(t time.Time) error {

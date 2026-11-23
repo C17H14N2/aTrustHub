@@ -54,6 +54,12 @@ func main() {
 	info := sess.Info()
 	fmt.Printf("connected in %s, client ip=%s, routes=%v\n",
 		time.Since(start).Round(time.Millisecond), info.ClientIP, info.NodeGroups)
+	go func() {
+		for i := 0; i < 12; i++ {
+			time.Sleep(10 * time.Second)
+			fmt.Printf("[%3ds] frames received: %d\n", int(time.Since(start).Seconds()), sess.FramesIn())
+		}
+	}()
 
 	target := os.Args[5]
 
@@ -106,6 +112,33 @@ func main() {
 				}
 			}
 		}
+		return
+	}
+
+	// MODE=diag re-leases DHCP and dials on a timer, to see which layer stops
+	// working first once the session ages past the hub's policy timeout.
+	if os.Getenv("SOFTETHER_MODE") == "diag" {
+		tick := time.NewTicker(10 * time.Second)
+		defer tick.Stop()
+		for time.Now().Before(deadline) {
+			<-tick.C
+			elapsed := int(time.Since(start).Seconds())
+			lease, lerr := sess.RenewLease(6 * time.Second)
+			dhcp := "no"
+			if lerr == nil {
+				dhcp = lease.IP.String()
+			}
+			cctx, ccancel := context.WithTimeout(context.Background(), 6*time.Second)
+			c, derr := sess.Dial(cctx, "tcp", target)
+			ccancel()
+			dial := "ok"
+			if derr != nil {
+				dial = derr.Error()
+			} else {
+				c.Close()
+			}
+fmt.Printf("[%3ds] dhcp=%s dial=%s\n", elapsed, dhcp, dial)
+			}
 		return
 	}
 

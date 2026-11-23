@@ -70,20 +70,6 @@ func Connect(ctx context.Context, point model.AccessPoint, creds vpn.Credentials
 		done:   make(chan struct{}),
 	}
 
-	// Keep the hub's data path warm with a real frame every few seconds.
-	go func() {
-		t := time.NewTicker(3 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-s.done:
-				return
-			case <-t.C:
-				_ = l2.PingGateway()
-			}
-		}
-	}()
-
 	// Pump frames into the stack.
 	go func() {
 		for {
@@ -175,8 +161,16 @@ func (s *Session) Dial(ctx context.Context, network, addr string) (net.Conn, err
 		conn, err = s.stack.DialContext(ctx, network, addr)
 	}
 	if err != nil {
-		if s.dialFails.Add(1) >= maxDialFailures {
-			s.fail(fmt.Errorf("连续 %d 次建连失败，重建会话：%w", maxDialFailures, err))
+		// A refused connection proves the tunnel works: the SYN reached the
+		// host and it answered. Only timeouts and routing failures mean the
+		// tunnel itself stopped carrying new flows, and only those should
+		// trigger a rebuild.
+		if tunnelStalled(err) {
+			if s.dialFails.Add(1) >= maxDialFailures {
+				s.fail(fmt.Errorf("连续 %d 次建连超时，重建会话：%w", maxDialFailures, err))
+			}
+		} else {
+			s.dialFails.Store(0)
 		}
 		return nil, err
 	}
@@ -184,10 +178,38 @@ func (s *Session) Dial(ctx context.Context, network, addr string) (net.Conn, err
 	return conn, nil
 }
 
-// maxDialFailures is how many dials may fail in a row before the session is
-// rebuilt. One failure can be a closed port; several mean the tunnel stopped
-// carrying new flows.
+// maxDialFailures is how many timer failures may happen in a row before the
+// session is rebuilt.
 const maxDialFailures = 2
+
+// tunnelStalled reports whether a dial failure points at the tunnel rather
+// than at the target: timeouts and routing errors mean no frame made it
+// through, while a refused connection means it did.
+func tunnelStalled(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, marker := range []string{"deadline exceeded", "no route to host", "i/o timeout", "connection interrupted"} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// RenewLease asks the hub for an address again, to check whether the DHCP side
+// of the session is still being served.
+func (s *Session) RenewLease(timeout time.Duration) (Lease, error) {
+	mac, err := randomMAC()
+	if err != nil {
+		return Lease{}, err
+	}
+	return s.stack.AcquireLease(mac, timeout)
+}
+
+// FramesIn reports how many frames the hub has sent, for diagnostics.
+func (s *Session) FramesIn() int64 { return s.client.FramesIn() }
 
 // Info describes the session for the UI.
 func (s *Session) Info() vpn.SessionInfo { return s.info }
