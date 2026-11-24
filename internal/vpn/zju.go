@@ -26,11 +26,19 @@ import (
 	"github.com/qy/easyconnect/internal/model"
 )
 
-// tcpTunnelMode 是 spike 开关：ATRUSTHUB_TCP_TUNNEL=1 时使用 aTrust TCP
-// 隧道栈。该模式只代理 TCP，全局 TUN 不可用。共享 IP 的域名资源必须走它，
-// 因为 L3 认证请求不带 domain，网关会以 address check error 拒绝。
+// tcpTunnelMode reports whether aTrust sessions use the TCP tunnel stack.
+//
+// It is on by default. These gateways publish several domain applications on
+// one shared backend IP and mark them enableTCPPrefL3=true, but the L3 auth
+// request carries only the IP, so the gateway answers "address check error" /
+// "is not a analyse ip from <domain>". The TCP tunnel sends domain:port and
+// lets the gateway resolve it, which works for both domain and plain-IP
+// resources.
+//
+// Set ATRUSTHUB_TCP_TUNNEL=0 to fall back to the gVisor L3 stack (needed only
+// for UDP resources or the global TUN, which the TCP tunnel cannot carry).
 func tcpTunnelMode() bool {
-	return os.Getenv("ATRUSTHUB_TCP_TUNNEL") == "1"
+	return os.Getenv("ATRUSTHUB_TCP_TUNNEL") != "0"
 }
 
 // ZJUOptions configure the ZJU-Connect backed connector.
