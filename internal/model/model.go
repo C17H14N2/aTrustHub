@@ -127,6 +127,17 @@ const (
 	KindSocks5 = "socks5"
 )
 
+// aTrust transport modes. Empty means TCP, which is what these gateways need.
+const (
+	// TransportTCP sends domain:port to the gateway and lets it resolve. It is
+	// required for domain applications that share one backend IP, because the
+	// L3 auth request carries only the IP and the gateway rejects it.
+	TransportTCP = "tcp"
+	// TransportL3 runs the gVisor L3 stack. Needed for UDP resources and for
+	// the global TUN, neither of which the TCP tunnel can carry.
+	TransportL3 = "l3"
+)
+
 // AccessPoint is one access point the app logs in to. Its cred and TOTP
 // secret live in the secret store, under the point's ID, not here.
 type AccessPoint struct {
@@ -138,6 +149,9 @@ type AccessPoint struct {
 	// Hub is the SoftEther virtual HUB name; unused by aTrust.
 	Hub      string `json:"hub,omitempty"`
 	Username string `json:"username"`
+	// Transport selects the aTrust tunnel stack; empty means TransportTCP.
+	// It has no meaning for SoftEther or external SOCKS5 points.
+	Transport string `json:"transport,omitempty"`
 	// Covers is the user-defined application boundary of a non-aTrust point:
 	// CIDRs, IP ranges and exact domains. aTrust points get theirs from the
 	// server instead.
@@ -182,6 +196,10 @@ func (p *AccessPoint) IsSoftEther() bool { return p.Kind == KindSoftEther }
 
 // IsSocks5 reports whether this point is an external SOCKS5 transport.
 func (p *AccessPoint) IsSocks5() bool { return p.Kind == KindSocks5 }
+
+// UsesL3Transport reports whether this aTrust point runs the gVisor L3 stack
+// instead of the TCP tunnel.
+func (p *AccessPoint) UsesL3Transport() bool { return p.Transport == TransportL3 }
 
 // IsATrust reports whether this point uses the aTrust backend (the default).
 func (p *AccessPoint) IsATrust() bool { return p.KindOrDefault() == KindATrust }
@@ -366,6 +384,9 @@ func (p *AccessPoint) Normalize() {
 	p.Username = strings.TrimSpace(p.Username)
 	if !p.IsATrust() {
 		p.Covers = NormalizeCovers(p.Covers)
+		p.Transport = ""
+	} else if p.Transport != TransportL3 {
+		p.Transport = TransportTCP
 	}
 	if p.IsATrust() && (p.AuthMode == "" || !AuthMode(p.AuthMode).Valid()) {
 		// Empty has always meant "账号密码"; keep that reading now that

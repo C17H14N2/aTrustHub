@@ -166,6 +166,7 @@ type editorDraft struct {
 	totp          string
 	domain        string
 	hub           string
+	transport     string
 	covers        []string
 	socksPort     string
 	inPool        bool

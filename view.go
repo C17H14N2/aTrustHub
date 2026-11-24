@@ -856,6 +856,13 @@ func (a *app) pointCard(c *ui.Context, v vpn.View) {
 		})
 
 		ui.Row(c).Gap(16).Children(func() {
+			if v.Kind == "" || v.Kind == model.KindATrust {
+				label := "TCP 隧道"
+				if v.Transport == model.TransportL3 {
+					label = "L3（gVisor）"
+				}
+				meta(c, t, "传输模式", label)
+			}
 			if v.Kind == model.KindSoftEther {
 				label := "进程内 L2"
 				if len(v.NodeGroups) > 0 {
@@ -1225,6 +1232,13 @@ func subtitleOf(v vpn.View) string {
 		}
 		return strings.Join(parts, " · ")
 	}
+	if v.KindOrDefaultIsATrust() {
+		if v.Transport == model.TransportL3 {
+			parts = append(parts, "L3 隧道")
+		} else {
+			parts = append(parts, "TCP 隧道")
+		}
+	}
 	switch model.AuthMode(v.AuthMode) {
 	case model.AuthModeAuto:
 		parts = append(parts, "自动识别（旧）")
@@ -1322,6 +1336,25 @@ func renderCovers(c *ui.Context, d *editorDraft, label, hint string) {
 	if hint != "" {
 		ui.Text(c, hint).FontSize(11).TextColor(t.TextMuted)
 	}
+}
+
+// transportLabels are the aTrust tunnel choices shown in the editor.
+func transportLabels() []string {
+	return []string{"TCP 隧道（推荐）", "L3 隧道（UDP / 全局 TUN）"}
+}
+
+func transportFromLabel(label string) string {
+	if label == transportLabels()[1] {
+		return model.TransportL3
+	}
+	return model.TransportTCP
+}
+
+func transportLabel(mode string) string {
+	if mode == model.TransportL3 {
+		return transportLabels()[1]
+	}
+	return transportLabels()[0]
 }
 
 // splitCovers accepts commas, semicolons and whitespace between entries.
@@ -1471,6 +1504,16 @@ func (a *app) editorView(c *ui.Context) {
 				ui.Text(c, "服务器支持："+strings.Join(d.detected, "、")).FontSize(11).
 					TextColor(t.TextMuted)
 			}
+			ui.Field(c, "传输模式", func() {
+					ui.Select(c, &d.transport, transportLabels()).Width(260)
+				})
+				if transportFromLabel(d.transport) == model.TransportL3 {
+					ui.Text(c, "L3 支持 UDP 与全局 TUN，但域名应用若共用同一后端 IP 会被网关拒绝。").
+						FontSize(11).TextColor(t.Warning)
+				} else {
+					ui.Text(c, "TCP 隧道把域名交给网关解析，共享 IP 的域名应用必须用它；不支持 UDP 与全局 TUN。").
+						FontSize(11).TextColor(t.TextMuted)
+				}
 			switch d.authMode {
 			case string(model.AuthModeWeCom):
 				// 企业微信：登录域用来在服务器提供多个外部登录时挑一个。
@@ -1974,6 +2017,7 @@ func (a *app) openNewEditor() {
 	a.editor = editorDraft{
 		open:          true,
 		kindLabel:     pointKindLabel(model.KindATrust),
+		transport:     transportLabel(model.TransportTCP),
 		address:       "",
 		authMode:      string(model.AuthModePassword),
 		authModeLabel: model.AuthModePassword.Label(),
@@ -2013,6 +2057,7 @@ func (a *app) openEditor(v vpn.View) {
 		authModeLabel: mode.Label(),
 		domain:        p.LoginDomain,
 		hub:           p.Hub,
+		transport:     transportLabel(p.Transport),
 		covers:        append([]string(nil), p.Covers...),
 		socksPort:     strconv.Itoa(p.SocksPort),
 		inPool:        p.InPool,
@@ -2123,6 +2168,7 @@ func (a *app) saveEditor() {
 		Port:        port,
 		Username:    username,
 		Hub:         strings.TrimSpace(d.hub),
+		Transport:   transportFromLabel(d.transport),
 		Covers:      covers,
 		AuthMode:    mode,
 		LoginDomain: strings.TrimSpace(d.domain),

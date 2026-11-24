@@ -26,19 +26,18 @@ import (
 	"github.com/qy/easyconnect/internal/model"
 )
 
-// tcpTunnelMode reports whether aTrust sessions use the TCP tunnel stack.
+// tcpTunnelMode reports whether this point uses the TCP tunnel stack.
 //
-// It is on by default. These gateways publish several domain applications on
-// one shared backend IP and mark them enableTCPPrefL3=true, but the L3 auth
-// request carries only the IP, so the gateway answers "address check error" /
-// "is not a analyse ip from <domain>". The TCP tunnel sends domain:port and
-// lets the gateway resolve it, which works for both domain and plain-IP
-// resources.
+// TCP is the default. These gateways publish several domain applications on one
+// shared backend IP and mark them enableTCPPrefL3=true, but the L3 auth request
+// carries only the IP, so the gateway answers "address check error" / "is not a
+// analyse ip from <domain>". The TCP tunnel sends domain:port and lets the
+// gateway resolve it, which works for both domain and plain-IP resources.
 //
-// Set ATRUSTHUB_TCP_TUNNEL=0 to fall back to the gVisor L3 stack (needed only
-// for UDP resources or the global TUN, which the TCP tunnel cannot carry).
-func tcpTunnelMode() bool {
-	return os.Getenv("ATRUSTHUB_TCP_TUNNEL") != "0"
+// The per-point setting chooses L3 when UDP resources or the global TUN are
+// needed, neither of which the TCP tunnel can carry.
+func tcpTunnelMode(point model.AccessPoint) bool {
+	return !point.UsesL3Transport()
 }
 
 // ZJUOptions configure the ZJU-Connect backed connector.
@@ -217,22 +216,23 @@ func connectZJU(ctx context.Context, opts ZJUOptions, point model.AccessPoint, c
 		secondary = dnsServers[1]
 	}
 
-	// SPIKE: ATRUSTHUB_TCP_TUNNEL=1 时改用 aTrust TCP 隧道栈（只支持 TCP，
-	// 不能开全局 TUN）。用于共享 IP 的域名资源：L3 认证不带 domain，网关会拒。
+	// The point's transport setting picks the stack: TCP carries domain names
+	// (required for shared-IP domain resources), L3 carries UDP and global TUN.
 	var vpnStack stack.Stack
-	if tcpTunnelMode() {
+	if tcpTunnelMode(point) {
 		ts, terr := tcptunnel.NewStack(client)
 		if terr != nil {
 			return nil, fmt.Errorf("创建 TCP 隧道栈：%w", terr)
 		}
 		vpnStack = ts
-		zjuLog.Printf("已启用 TCP 隧道模式（spike）")
+		zjuLog.Printf("[%s] 传输模式：TCP 隧道", point.Name)
 	} else {
 		gs, gerr := gvisor.NewStack(client)
 		if gerr != nil {
 			return nil, fmt.Errorf("创建 gVisor 网络栈：%w", gerr)
 		}
 		vpnStack = gs
+		zjuLog.Printf("[%s] 传输模式：L3（gVisor）", point.Name)
 	}
 	resolver := resolve.NewResolver(
 		vpnStack, remoteDNS, secondary, opts.DNSTTL,

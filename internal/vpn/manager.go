@@ -112,7 +112,9 @@ type View struct {
 	Server string
 	Port   int
 	// Hub is the SoftEther virtual HUB; empty for other kinds.
-	Hub         string
+	Hub string
+	// Transport is the aTrust tunnel stack in use ("tcp" or "l3").
+	Transport string
 	Username    string
 	AuthMode    string
 	LoginDomain string
@@ -450,6 +452,7 @@ func (m *Manager) Views() []View {
 		v := View{
 			ID: ep.cfg.ID, Kind: ep.cfg.KindOrDefault(),
 			Name: ep.cfg.Name, Server: ep.cfg.Server, Hub: ep.cfg.Hub,
+			Transport: ep.cfg.Transport,
 			Port: ep.cfg.Port, Username: ep.cfg.Username,
 			AuthMode: ep.cfg.AuthMode, LoginDomain: ep.cfg.LoginDomain,
 			SocksPort: ep.cfg.SocksPort,
@@ -487,6 +490,11 @@ func (m *Manager) View(id string) (View, bool) {
 		}
 	}
 	return View{}, false
+}
+
+// KindOrDefaultIsATrust reports whether this view is an aTrust point.
+func (v View) KindOrDefaultIsATrust() bool {
+	return v.Kind == "" || v.Kind == model.KindATrust
 }
 
 // Counts returns how many access points are online, connecting and total.
